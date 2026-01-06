@@ -6,6 +6,8 @@
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 or
  * (at your option) any later version.
+ *  Try git diff  64db39ba688ebb71b102fd0edffede79f928ed3a
+ *  To see major changes compared to espressifs original qemu.
  */
 
 #include "qemu/osdep.h"
@@ -82,7 +84,62 @@ static const struct MemmapEntry {
 #define ESP32_SOC_RESET_RTC       0x8
 #define ESP32_SOC_RESET_ALL       (ESP32_SOC_RESET_RTC | ESP32_SOC_RESET_DIG)
 
+/* Logging for the BTDM RivieraWaves-based peripheral */
+static uint64_t btdm_mmio_read(void *opaque, hwaddr addr, unsigned size)
+{
+    uint32_t val = 0;
+    /* You can add custom return values here for specific registers 
+       like BB_VERSION (0x204) to satisfy driver checks */
+    qemu_log_mask(LOG_GUEST_ERROR, "BTDM READ: offset 0x%" HWADDR_PRIx 
+                  " (size %u) -> 0x%08x\n", addr, size, val);
+    return val;
+}
 
+static void btdm_mmio_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
+{
+    qemu_log_mask(LOG_UNIMP, "BTDM WRITE: offset 0x%" HWADDR_PRIx 
+                  " (size %u) <- 0x%08" PRIx64 "\n", addr, size, val);
+    
+    /* Logic intercept: If the guest writes to 0x200 (BLECNTL) 
+       with bit 31 set, it's a RivieraWaves Master Soft Reset */
+    if (addr == 0x200 && (val & (1 << 31))) {
+        qemu_log("BTDM: Guest requested RW-BLE Master Soft Reset\n");
+    }
+}
+
+/* Intercepts the Data Plane (Exchange Memory) */
+static uint64_t btdm_em_read(void *opaque, hwaddr addr, unsigned size) {
+    uint8_t *em_ptr = (uint8_t *)opaque; 
+    uint32_t val = 0;
+    memcpy(&val, em_ptr + addr, size);
+    return val;
+}
+
+static void btdm_em_write(void *opaque, hwaddr addr, uint64_t val, unsigned size) {
+    uint8_t *em_ptr = (uint8_t *)opaque;
+    memcpy(em_ptr + addr, &val, size);
+    
+    /* Log specific data writes like your ASCII '74' (0x4A) */
+    if (val == 0x4A) {
+        qemu_log("BTDM_EM: Data '74' written to buffer at offset 0x%" HWADDR_PRIx "\n", addr);
+    }
+}
+
+static const MemoryRegionOps btdm_em_ops = {
+    .read = btdm_em_read,
+    .write = btdm_em_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+};
+
+static const MemoryRegionOps btdm_ops = {
+    .read = btdm_mmio_read,
+    .write = btdm_mmio_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid = {
+        .min_access_size = 4,
+        .max_access_size = 4,
+    },
+};
 
 
 static void remove_cpu_watchpoints(XtensaCPU* xcs)
@@ -349,6 +406,26 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
     memory_region_init_alias(rtcfast_d, NULL, "esp32.rtcfast_d", rtcfast_i, 0, memmap[ESP32_MEMREGION_RTCFAST_D].size);
     memory_region_add_subregion(&s->cpu_specific_mem[0], memmap[ESP32_MEMREGION_RTCFAST_D].base, rtcfast_d);
 
+    /* 1. Link Controller (0x3ff51000) */
+    MemoryRegion *bt_lc_io = g_new(MemoryRegion, 1);
+    memory_region_init_io(bt_lc_io, OBJECT(dev), &bt_controller_ops, s, "esp32.bt_lc", 0x1000);
+    memory_region_add_subregion(sys_mem, DR_REG_BT_BASE, bt_lc_io);
+
+    /* 2. Radio PHY / Baseband (0x3ff71000) */
+    MemoryRegion *bt_phy_io = g_new(MemoryRegion, 1);
+    memory_region_init_io(bt_phy_io, OBJECT(dev), &phy_mmio_ops, s, "esp32.bt_phy", 0x1000);
+    memory_region_add_subregion(sys_mem, DR_REG_PHY_BASE, bt_phy_io);
+
+    /* 3. Exchange Memory (0x3ffb0000) - Logged RAM */
+    uint8_t *em_storage = g_malloc0(BT_EM_SIZE);
+    MemoryRegion *em_io = g_new(MemoryRegion, 1);
+    memory_region_init_io(em_io, OBJECT(dev), &btdm_em_ops, em_storage, "esp32.bt_em", BT_EM_SIZE);
+    memory_region_add_subregion(sys_mem, DR_REG_BT_EM_BASE, em_io);
+
+    qemu_log("BTDM Interception Enabled: LC(0x%x), PHY(0x%x), EM(0x%x)\n", 
+             DR_REG_BT_BASE, DR_REG_PHY_BASE, DR_REG_BT_EM_BASE);
+
+
     for (int i = 0; i < ms->smp.cpus; ++i) {
         qdev_realize(DEVICE(&s->cpu[i]), NULL, &error_fatal);
     }
@@ -588,11 +665,20 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
     esp32_soc_add_unimp_device(sys_mem, "esp32.i2s0", DR_REG_I2S_BASE, 0x1000,0);
     esp32_soc_add_unimp_device(sys_mem, "esp32.i2s1", DR_REG_I2S1_BASE, 0x1000,0);
     esp32_soc_add_unimp_device(sys_mem, "esp32.fe2", DR_REG_FE2_BASE, 0x1000, -1);
-    esp32_soc_add_unimp_device(sys_mem, "esp32.chipv7_phy", DR_REG_PHY_BASE, 0x1000,-1);
+    //esp32_soc_add_unimp_device(sys_mem, "esp32.chipv7_phy", DR_REG_PHY_BASE, 0x1000,-1);
     esp32_soc_add_unimp_device(sys_mem, "esp32.chipv7_phyb", DR_REG_WDEV_BASE, 0x1000,0);
     esp32_soc_add_unimp_device(sys_mem, "esp32.unknown_wifi", DR_REG_NRX_BASE  , 0x1000,-1);
     esp32_soc_add_unimp_device(sys_mem, "esp32.unknown_wifi1", DR_REG_BB_BASE , 0x1000,-1);
     esp32_soc_add_unimp_device(sys_mem, "esp32.bt", DR_REG_BT_BASE, 0x1000, 0);
+
+    /* Register the BTDM peripheral with logging callbacks */
+    MemoryRegion *btdm_io = g_new(MemoryRegion, 1);
+    memory_region_init_io(btdm_io, OBJECT(dev), &btdm_ops, s, "esp32.btdm", 0x1000);
+    memory_region_add_subregion(sys_mem, DR_REG_BT_BASE, btdm_io);
+
+    /* Log the initialization */
+    qemu_log("BTDM RivieraWaves IP core mapped at 0x%08x\n", (uint32_t)DR_REG_BT_BASE);
+
 
     /* st7789v is attached to SPI2 and SPI3 so the both HSPI and VSPI will work,
     they share a single console*/
