@@ -123,6 +123,7 @@ static void btdm_em_write(void *opaque, hwaddr addr, uint64_t val, unsigned size
     if (val == 0x4A) {
         qemu_log("BTDM_EM: Data '74' written to buffer at offset 0x%" HWADDR_PRIx "\n", addr);
     }
+
 }
 
 static const MemoryRegionOps btdm_em_ops = {
@@ -134,6 +135,115 @@ static const MemoryRegionOps btdm_em_ops = {
 static const MemoryRegionOps btdm_ops = {
     .read = btdm_mmio_read,
     .write = btdm_mmio_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid = {
+        .min_access_size = 4,
+        .max_access_size = 4,
+    },
+};
+
+/* BT Link Controller (0x3ff51000) read/write handlers */
+static uint64_t bt_controller_read(void *opaque, hwaddr addr, unsigned size)
+{
+    uint32_t val = 0;
+
+    switch (addr) {
+    case 0x004: /* BTVERSION - BR/EDR version register */
+        /* Return a valid version: TYP=0x09, REL=0x09, UPG=0x00, BUILD=0x00 */
+        val = 0x09090000;
+        break;
+    case 0x000: /* BTCNTL */
+    case 0x00C: /* BTINTCNTL */
+    case 0x010: /* BTINTSTAT */
+    case 0x014: /* BTINTRAWSTAT */
+    case 0x018: /* BTINTACK */
+        val = 0;
+        break;
+    default:
+        qemu_log_mask(LOG_UNIMP, "BT_LC READ: unhandled offset 0x%" HWADDR_PRIx
+                      " (size %u)\n", addr, size);
+        break;
+    }
+
+    qemu_log_mask(LOG_GUEST_ERROR, "BT_LC READ: offset 0x%" HWADDR_PRIx
+                  " (size %u) -> 0x%08x\n", addr, size, val);
+    return val;
+}
+
+static void bt_controller_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
+{
+    qemu_log_mask(LOG_UNIMP, "BT_LC WRITE: offset 0x%" HWADDR_PRIx
+                  " (size %u) <- 0x%08" PRIx64 "\n", addr, size, val);
+
+    switch (addr) {
+    case 0x000: /* BTCNTL */
+        if (val & (1 << 31)) {
+            qemu_log("BT_LC: Guest requested BR/EDR Soft Reset\n");
+        }
+        break;
+    case 0x018: /* BTINTACK - Interrupt acknowledgment */
+        /* Guest is acknowledging interrupts, just log it */
+        break;
+    default:
+        break;
+    }
+}
+
+static const MemoryRegionOps bt_controller_ops = {
+    .read = bt_controller_read,
+    .write = bt_controller_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid = {
+        .min_access_size = 4,
+        .max_access_size = 4,
+    },
+};
+
+/* PHY/Baseband (0x3ff71000) read/write handlers */
+static uint64_t phy_mmio_read(void *opaque, hwaddr addr, unsigned size)
+{
+    uint32_t val = 0;
+
+    switch (addr) {
+    case 0x004: /* BLEVERSION at offset 0x204 from BTDM base, 0x04 from PHY base */
+        /* Return valid BLE version: TYP=0x09, REL=0x09, UPG=0x00, BUILD=0x00 */
+        val = 0x09090000;
+        break;
+    case 0x000: /* BLECNTL */
+        val = 0;
+        break;
+    default:
+        /* Return -1 for unknown registers to satisfy some driver checks */
+        val = 0xFFFFFFFF;
+        qemu_log_mask(LOG_UNIMP, "PHY READ: unhandled offset 0x%" HWADDR_PRIx
+                      " (size %u)\n", addr, size);
+        break;
+    }
+
+    qemu_log_mask(LOG_GUEST_ERROR, "PHY READ: offset 0x%" HWADDR_PRIx
+                  " (size %u) -> 0x%08x\n", addr, size, val);
+    return val;
+}
+
+static void phy_mmio_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
+{
+    qemu_log_mask(LOG_UNIMP, "PHY WRITE: offset 0x%" HWADDR_PRIx
+                  " (size %u) <- 0x%08" PRIx64 "\n", addr, size, val);
+
+    switch (addr) {
+    case 0x000: /* BLECNTL */
+        if (val & (1 << 31)) {
+            qemu_log("PHY: Guest requested BLE Master Soft Reset\n");
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+static const MemoryRegionOps phy_mmio_ops = {
+    .read = phy_mmio_read,
+    .write = phy_mmio_write,
     .endianness = DEVICE_NATIVE_ENDIAN,
     .valid = {
         .min_access_size = 4,
