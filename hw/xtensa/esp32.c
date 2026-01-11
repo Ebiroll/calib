@@ -528,6 +528,13 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
 
     /* 3. Exchange Memory (0x3ffb0000) - Logged RAM */
     uint8_t *em_storage = g_malloc0(BT_EM_SIZE);
+    
+    /* Initialize NVDS magic number at offset 0 (little-endian: 0xfadebead) */
+    em_storage[0] = 0xad;
+    em_storage[1] = 0xbe;
+    em_storage[2] = 0xde;
+    em_storage[3] = 0xfa;
+    
     MemoryRegion *em_io = g_new(MemoryRegion, 1);
     memory_region_init_io(em_io, OBJECT(dev), &btdm_em_ops, em_storage, "esp32.bt_em", BT_EM_SIZE);
     memory_region_add_subregion(sys_mem, DR_REG_BT_EM_BASE, em_io);
