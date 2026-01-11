@@ -939,6 +939,8 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
     esp32_soc_add_unimp_device(sys_mem, "esp32.chipv7_phyb", DR_REG_WDEV_BASE, 0x1000,0);
     esp32_soc_add_unimp_device(sys_mem, "esp32.unknown_wifi", DR_REG_NRX_BASE  , 0x1000,-1);
     esp32_soc_add_unimp_device(sys_mem, "esp32.unknown_wifi1", DR_REG_BB_BASE , 0x1000,-1);
+    /* Extended WIFI/PHY region - covers 0x3ff73000-0x3ff73fff + extended area for phy_chip_v7 */
+    esp32_soc_add_unimp_device(sys_mem, "esp32.wifi_phy", DR_REG_WIFI_BASE, 0x1000, 0);
     esp32_soc_add_unimp_device(sys_mem, "esp32.bt", DR_REG_BT_BASE, 0x1000, 0);
 
     /* Register the BTDM peripheral with logging callbacks */
