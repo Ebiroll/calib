@@ -242,8 +242,10 @@ static struct {
     uint32_t reg_030;           /* 0x030 */
     uint32_t reg_034;           /* 0x034 */
     uint32_t reg_038;           /* 0x038 */
+    uint32_t reg_03c;           /* 0x03C */
     uint32_t reg_040;           /* 0x040 */
     uint32_t reg_044;           /* 0x044 */
+    uint32_t reg_050;           /* 0x050 */
     uint32_t reg_060;           /* 0x060 */
     uint32_t reg_064;           /* 0x064 */
     uint32_t reg_070;           /* 0x070 */
@@ -254,6 +256,9 @@ static struct {
     uint32_t reg_0b0;           /* 0x0B0 */
     uint32_t reg_0b4;           /* 0x0B4 */
     uint32_t reg_0bc;           /* 0x0BC */
+    uint32_t reg_0c0;           /* 0x0C0 */
+    uint32_t reg_0c4;           /* 0x0C4 */
+    uint32_t reg_0d0;           /* 0x0D0 - WiFi/BT coexistence control */
     uint32_t reg_140;           /* 0x140 */
     uint32_t reg_160;           /* 0x160 */
     uint32_t reg_180;           /* 0x180 */
@@ -294,6 +299,7 @@ static struct {
     uint32_t blecoexifcntl0;    /* 0x300 */
     uint32_t bleralptr;         /* 0x320 */
     uint32_t bleralnbdev;       /* 0x324 */
+    uint32_t reg_390;           /* 0x390 */
     bool initialized;
 } btdm_state;
 
@@ -315,8 +321,10 @@ static void btdm_state_init(void)
     btdm_state.reg_030 = 0x00000000;
     btdm_state.reg_034 = 0x00000000;
     btdm_state.reg_038 = 0x00000000;
+    btdm_state.reg_03c = 0x00000000;
     btdm_state.reg_040 = 0x00000000;
     btdm_state.reg_044 = 0x00000000;
+    btdm_state.reg_050 = 0x00000000;
     btdm_state.reg_060 = 0x00000000;
     btdm_state.reg_064 = 0x00000000;
     btdm_state.reg_070 = 0x00000000;
@@ -327,6 +335,9 @@ static void btdm_state_init(void)
     btdm_state.reg_0b0 = 0x00000000;
     btdm_state.reg_0b4 = 0x00000000;
     btdm_state.reg_0bc = 0x00000000;
+    btdm_state.reg_0c0 = 0x00000000;
+    btdm_state.reg_0c4 = 0x00000000;
+    btdm_state.reg_0d0 = 0x00000000;
     btdm_state.reg_140 = 0x00000000;
     btdm_state.reg_160 = 0x00000000;
     btdm_state.reg_180 = 0x00000000;
@@ -366,6 +377,7 @@ static void btdm_state_init(void)
     btdm_state.blecoexifcntl0 = 0x00000000;
     btdm_state.bleralptr = 0x00000000;
     btdm_state.bleralnbdev = 0x00000000;
+    btdm_state.reg_390 = 0x00000000;
     btdm_state.initialized = true;
 }
 
@@ -393,8 +405,10 @@ static uint64_t phy_mmio_read(void *opaque, hwaddr addr, unsigned size)
     case 0x030: val = btdm_state.reg_030; break;
     case 0x034: val = btdm_state.reg_034; break;
     case 0x038: val = btdm_state.reg_038; break;
+    case 0x03C: val = btdm_state.reg_03c; break;
     case 0x040: val = btdm_state.reg_040; break;
     case 0x044: val = btdm_state.reg_044; break;
+    case 0x050: val = btdm_state.reg_050; break;
     case 0x060: val = btdm_state.reg_060; break;
     case 0x064: val = btdm_state.reg_064; break;
     case 0x070: val = btdm_state.reg_070; break;
@@ -405,6 +419,9 @@ static uint64_t phy_mmio_read(void *opaque, hwaddr addr, unsigned size)
     case 0x0B0: val = btdm_state.reg_0b0; break;
     case 0x0B4: val = btdm_state.reg_0b4; break;
     case 0x0BC: val = btdm_state.reg_0bc; break;
+    case 0x0C0: val = btdm_state.reg_0c0; break;
+    case 0x0C4: val = btdm_state.reg_0c4; break;
+    case 0x0D0: val = btdm_state.reg_0d0; break;
     case 0x140: val = btdm_state.reg_140; break;
     case 0x160: val = btdm_state.reg_160; break;
     case 0x180: val = btdm_state.reg_180; break;
@@ -448,6 +465,7 @@ static uint64_t phy_mmio_read(void *opaque, hwaddr addr, unsigned size)
     case 0x300: val = btdm_state.blecoexifcntl0; break;
     case 0x320: val = btdm_state.bleralptr; break;
     case 0x324: val = btdm_state.bleralnbdev; break;
+    case 0x390: val = btdm_state.reg_390; break;
     default:
         /* Return 0 for unknown registers instead of 0xffffffff */
         val = 0;
@@ -490,8 +508,10 @@ static void phy_mmio_write(void *opaque, hwaddr addr, uint64_t val, unsigned siz
     case 0x030: btdm_state.reg_030 = val; break;
     case 0x034: btdm_state.reg_034 = val; break;
     case 0x038: btdm_state.reg_038 = val; break;
+    case 0x03C: btdm_state.reg_03c = val; break;
     case 0x040: btdm_state.reg_040 = val; break;
     case 0x044: btdm_state.reg_044 = val; break;
+    case 0x050: btdm_state.reg_050 = val; break;
     case 0x060: btdm_state.reg_060 = val; break;
     case 0x064: btdm_state.reg_064 = val; break;
     case 0x070: btdm_state.reg_070 = val; break;
@@ -502,6 +522,9 @@ static void phy_mmio_write(void *opaque, hwaddr addr, uint64_t val, unsigned siz
     case 0x0B0: btdm_state.reg_0b0 = val; break;
     case 0x0B4: btdm_state.reg_0b4 = val; break;
     case 0x0BC: btdm_state.reg_0bc = val; break;
+    case 0x0C0: btdm_state.reg_0c0 = val; break;
+    case 0x0C4: btdm_state.reg_0c4 = val; break;
+    case 0x0D0: btdm_state.reg_0d0 = val; break;
     case 0x140: btdm_state.reg_140 = val; break;
     case 0x160: btdm_state.reg_160 = val; break;
     case 0x180: btdm_state.reg_180 = val; break;
@@ -550,6 +573,7 @@ static void phy_mmio_write(void *opaque, hwaddr addr, uint64_t val, unsigned siz
     case 0x300: btdm_state.blecoexifcntl0 = val; break;
     case 0x320: btdm_state.bleralptr = val; break;
     case 0x324: btdm_state.bleralnbdev = val; break;
+    case 0x390: btdm_state.reg_390 = val; break;
     default:
         qemu_log_mask(LOG_UNIMP, "BTDM WRITE: unhandled offset 0x%" HWADDR_PRIx
                       " (size %u) <- 0x%08" PRIx64 "\n", addr, size, val);
@@ -888,6 +912,21 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
     MemoryRegion *bt_phy_io = g_new(MemoryRegion, 1);
     memory_region_init_io(bt_phy_io, OBJECT(dev), &phy_mmio_ops, s, "esp32.bt_phy", 0x1000);
     memory_region_add_subregion(sys_mem, DR_REG_PHY_BASE, bt_phy_io);
+
+    /* 2b. APB alias for PHY region (0x60031000) - used by DPORT/instruction bus */
+    MemoryRegion *bt_phy_apb = g_new(MemoryRegion, 1);
+    memory_region_init_io(bt_phy_apb, OBJECT(dev), &phy_mmio_ops, s, "esp32.bt_phy_apb", 0x1000);
+    memory_region_add_subregion(sys_mem, 0x60031000, bt_phy_apb);
+
+    /* 2c. Baseband registers (0x3ff72000 / APB 0x60032000) - simple RAM storage */
+    MemoryRegion *bt_bb_io = g_new(MemoryRegion, 1);
+    memory_region_init_ram(bt_bb_io, OBJECT(dev), "esp32.bt_bb", 0x1000, &error_fatal);
+    memory_region_add_subregion(sys_mem, 0x3ff72000, bt_bb_io);
+
+    /* 2d. APB alias for BB region (0x60032000) */
+    MemoryRegion *bt_bb_apb = g_new(MemoryRegion, 1);
+    memory_region_init_alias(bt_bb_apb, OBJECT(dev), "esp32.bt_bb_apb", bt_bb_io, 0, 0x1000);
+    memory_region_add_subregion(sys_mem, 0x60032000, bt_bb_apb);
 
     /* 3. Exchange Memory (0x3ffb0000) - Logged RAM */
     uint8_t *em_storage = g_malloc0(BT_EM_SIZE);
