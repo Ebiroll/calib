@@ -296,6 +296,7 @@ static inline const char *acl_llid_name(uint8_t llid)
 /* Debug print helper for RX descriptor */
 static inline void em_bt_rxdesc_print(const em_bt_rxdesc_t *desc, uint32_t addr)
 {
+#if 1  
     em_bt_rxstat_t stat = { .val = desc->rxstat };
     em_bt_header_t hdr = { .raw = desc->bt_header };
     em_acl_header_t acl = { .raw = desc->acl_header };
@@ -315,11 +316,14 @@ static inline void em_bt_rxdesc_print(const em_bt_rxdesc_t *desc, uint32_t addr)
     qemu_log("  RSSI: %d dBm, CH: %d\n", (int8_t)rssi.rssi, rssi.channel);
     qemu_log("  RXCTRL: 0x%04x (enc=%d mic=%d edr=%d fhs=%d)\n",
              ctrl.val, ctrl.encrypted, ctrl.mic_ok, ctrl.is_edr, ctrl.is_fhs);
+#endif
+    (void)desc; (void)addr;  /* Suppress unused warnings */
 }
 
 /* Debug print helper for TX descriptor */
 static inline void em_bt_txdesc_print(const em_bt_txdesc_t *desc, uint32_t addr)
 {
+#if 1  /* Disabled - too verbose */
     em_bt_txctrl_t ctrl = { .val = desc->txctrl };
     em_bt_header_t hdr = { .raw = desc->bt_header };
     em_acl_header_t acl = { .raw = desc->acl_header };
@@ -342,6 +346,8 @@ static inline void em_bt_txdesc_print(const em_bt_txdesc_t *desc, uint32_t addr)
              rate.val, rate.rate, rate.power, rate.is_edr);
     qemu_log("  TXSTAT: 0x%04x (retries=%d ack=%d flush=%d timeout=%d)\n",
              stat.val, stat.retries, stat.acked, stat.flushed, stat.timeout);
+#endif
+    (void)desc; (void)addr;  /* Suppress unused warnings */
 }
 
 #endif /* ESP32_BT_DBG_H */

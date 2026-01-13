@@ -88,7 +88,7 @@ static const struct MemmapEntry {
 #include "qemu/timer.h"
 
 /* Debug level for EM access logging (0=off, 1=NVDS only, 2=annotated, 3=verbose+desc) */
-static int btdm_em_debug_level = 2;
+static int btdm_em_debug_level = 1;
 
 /* BLE interrupt bits for BLEINTRAWSTAT/BLEINTSTAT */
 #define BLE_CSCNT_INTSTAT_BIT       (1 << 0)   /* Clock counter wrap */
