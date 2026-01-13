@@ -84,29 +84,6 @@ static const struct MemmapEntry {
 #define ESP32_SOC_RESET_RTC       0x8
 #define ESP32_SOC_RESET_ALL       (ESP32_SOC_RESET_RTC | ESP32_SOC_RESET_DIG)
 
-/* Logging for the BTDM RivieraWaves-based peripheral */
-static uint64_t btdm_mmio_read(void *opaque, hwaddr addr, unsigned size)
-{
-    uint32_t val = 0;
-    /* You can add custom return values here for specific registers 
-       like BB_VERSION (0x204) to satisfy driver checks */
-    qemu_log_mask(LOG_GUEST_ERROR, "BTDM READ: offset 0x%" HWADDR_PRIx 
-                  " (size %u) -> 0x%08x\n", addr, size, val);
-    return val;
-}
-
-static void btdm_mmio_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
-{
-    qemu_log_mask(LOG_UNIMP, "BTDM WRITE: offset 0x%" HWADDR_PRIx 
-                  " (size %u) <- 0x%08" PRIx64 "\n", addr, size, val);
-    
-    /* Logic intercept: If the guest writes to 0x200 (BLECNTL) 
-       with bit 31 set, it's a RivieraWaves Master Soft Reset */
-    if (addr == 0x200 && (val & (1 << 31))) {
-        qemu_log("BTDM: Guest requested RW-BLE Master Soft Reset\n");
-    }
-}
-
 /* Intercepts the Data Plane (Exchange Memory) */
 static uint64_t btdm_em_read(void *opaque, hwaddr addr, unsigned size) {
     uint8_t *em_ptr = (uint8_t *)opaque; 
@@ -132,59 +109,101 @@ static const MemoryRegionOps btdm_em_ops = {
     .endianness = DEVICE_NATIVE_ENDIAN,
 };
 
-static const MemoryRegionOps btdm_ops = {
-    .read = btdm_mmio_read,
-    .write = btdm_mmio_write,
-    .endianness = DEVICE_NATIVE_ENDIAN,
-    .valid = {
-        .min_access_size = 4,
-        .max_access_size = 4,
-    },
-};
+/* BT Link Controller (0x3ff51000) state */
+static struct {
+    uint32_t btcntl;        /* 0x000 */
+    uint32_t btversion;     /* 0x004 */
+    uint32_t btintcntl;     /* 0x00C */
+    uint32_t btintstat;     /* 0x010 */
+    uint32_t btintrawstat;  /* 0x014 */
+    uint32_t btintack;      /* 0x018 */
+    uint32_t reg_02c;       /* 0x02C - unknown, used in ld_reset */
+    uint32_t reg_080;       /* 0x080 - unknown, used in ld_reset */
+    uint32_t reg_140;       /* 0x140 - unknown, used in ld_reset */
+    uint32_t reg_160;       /* 0x160 - unknown, used in ld_reset */
+    uint32_t reg_180;       /* 0x180 - unknown, used in ld_reset */
+    uint32_t reg_1a0;       /* 0x1A0 - unknown, used in ld_reset */
+    uint32_t reg_1b0;       /* 0x1B0 - unknown, used in ld_reset */
+    bool initialized;
+} bt_lc_state;
+
+static void bt_lc_state_init(void)
+{
+    if (bt_lc_state.initialized) {
+        return;
+    }
+    bt_lc_state.btcntl = 0x0000710c;
+    bt_lc_state.btversion = 0x08000b00;
+    bt_lc_state.btintcntl = 0x0003c802;
+    bt_lc_state.btintstat = 0x00000000;
+    bt_lc_state.btintrawstat = 0x00000001;
+    bt_lc_state.btintack = 0x00000000;
+    bt_lc_state.reg_02c = 0x00000000;
+    bt_lc_state.reg_080 = 0x00000000;
+    bt_lc_state.reg_140 = 0x00000000;
+    bt_lc_state.reg_160 = 0x00000000;
+    bt_lc_state.reg_180 = 0x00000000;
+    bt_lc_state.reg_1a0 = 0x00000000;
+    bt_lc_state.reg_1b0 = 0x00000000;
+    bt_lc_state.initialized = true;
+}
 
 /* BT Link Controller (0x3ff51000) read/write handlers */
 static uint64_t bt_controller_read(void *opaque, hwaddr addr, unsigned size)
 {
     uint32_t val = 0;
 
+    bt_lc_state_init();
+
     switch (addr) {
-    case 0x004: /* BTVERSION - BR/EDR version register */
-        /* Return a valid version: TYP=0x09, REL=0x09, UPG=0x00, BUILD=0x00 */
-        val = 0x09090000;
-        break;
-    case 0x000: /* BTCNTL */
-    case 0x00C: /* BTINTCNTL */
-    case 0x010: /* BTINTSTAT */
-    case 0x014: /* BTINTRAWSTAT */
-    case 0x018: /* BTINTACK */
-        val = 0;
-        break;
+    case 0x000: val = bt_lc_state.btcntl; break;
+    case 0x004: val = bt_lc_state.btversion; break;
+    case 0x00C: val = bt_lc_state.btintcntl; break;
+    case 0x010: val = bt_lc_state.btintstat; break;
+    case 0x014: val = bt_lc_state.btintrawstat; break;
+    case 0x018: val = bt_lc_state.btintack; break;
+    case 0x02C: val = bt_lc_state.reg_02c; break;
+    case 0x080: val = bt_lc_state.reg_080; break;
+    case 0x140: val = bt_lc_state.reg_140; break;
+    case 0x160: val = bt_lc_state.reg_160; break;
+    case 0x180: val = bt_lc_state.reg_180; break;
+    case 0x1A0: val = bt_lc_state.reg_1a0; break;
+    case 0x1B0: val = bt_lc_state.reg_1b0; break;
     default:
         qemu_log_mask(LOG_UNIMP, "BT_LC READ: unhandled offset 0x%" HWADDR_PRIx
                       " (size %u)\n", addr, size);
         break;
     }
 
-    qemu_log_mask(LOG_GUEST_ERROR, "BT_LC READ: offset 0x%" HWADDR_PRIx
-                  " (size %u) -> 0x%08x\n", addr, size, val);
     return val;
 }
 
 static void bt_controller_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
 {
-    qemu_log_mask(LOG_UNIMP, "BT_LC WRITE: offset 0x%" HWADDR_PRIx
-                  " (size %u) <- 0x%08" PRIx64 "\n", addr, size, val);
+    bt_lc_state_init();
 
     switch (addr) {
-    case 0x000: /* BTCNTL */
+    case 0x000: 
+        bt_lc_state.btcntl = val;
         if (val & (1 << 31)) {
             qemu_log("BT_LC: Guest requested BR/EDR Soft Reset\n");
         }
         break;
-    case 0x018: /* BTINTACK - Interrupt acknowledgment */
-        /* Guest is acknowledging interrupts, just log it */
-        break;
+    case 0x004: bt_lc_state.btversion = val; break;
+    case 0x00C: bt_lc_state.btintcntl = val; break;
+    case 0x010: bt_lc_state.btintstat = val; break;
+    case 0x014: bt_lc_state.btintrawstat = val; break;
+    case 0x018: bt_lc_state.btintack = val; break;
+    case 0x02C: bt_lc_state.reg_02c = val; break;
+    case 0x080: bt_lc_state.reg_080 = val; break;
+    case 0x140: bt_lc_state.reg_140 = val; break;
+    case 0x160: bt_lc_state.reg_160 = val; break;
+    case 0x180: bt_lc_state.reg_180 = val; break;
+    case 0x1A0: bt_lc_state.reg_1a0 = val; break;
+    case 0x1B0: bt_lc_state.reg_1b0 = val; break;
     default:
+        qemu_log_mask(LOG_UNIMP, "BT_LC WRITE: unhandled offset 0x%" HWADDR_PRIx
+                      " (size %u) <- 0x%08" PRIx64 "\n", addr, size, val);
         break;
     }
 }
@@ -205,8 +224,40 @@ static const MemoryRegionOps bt_controller_ops = {
  * The BLE section starts at offset 0x200.
  */
 
-/* BTDM register state - simple static storage for now */
+/* BTDM register state - covers both BR/EDR (0x000-0x1FF) and BLE (0x200+) sections */
 static struct {
+    /* BR/EDR Section (offset 0x000-0x1FF) */
+    uint32_t btcntl;            /* 0x000 */
+    uint32_t btversion;         /* 0x004 */
+    uint32_t btintcntl;         /* 0x00C */
+    uint32_t btintstat;         /* 0x010 */
+    uint32_t btintrawstat;      /* 0x014 */
+    uint32_t btintack;          /* 0x018 */
+    uint32_t reg_01c;           /* 0x01C */
+    uint32_t reg_028;           /* 0x028 */
+    uint32_t reg_02c;           /* 0x02C */
+    uint32_t reg_030;           /* 0x030 */
+    uint32_t reg_034;           /* 0x034 */
+    uint32_t reg_038;           /* 0x038 */
+    uint32_t reg_040;           /* 0x040 */
+    uint32_t reg_044;           /* 0x044 */
+    uint32_t reg_060;           /* 0x060 */
+    uint32_t reg_064;           /* 0x064 */
+    uint32_t reg_070;           /* 0x070 */
+    uint32_t reg_074;           /* 0x074 */
+    uint32_t reg_080;           /* 0x080 */
+    uint32_t reg_098;           /* 0x098 */
+    uint32_t reg_0a4;           /* 0x0A4 */
+    uint32_t reg_0b0;           /* 0x0B0 */
+    uint32_t reg_0b4;           /* 0x0B4 */
+    uint32_t reg_0bc;           /* 0x0BC */
+    uint32_t reg_140;           /* 0x140 */
+    uint32_t reg_160;           /* 0x160 */
+    uint32_t reg_180;           /* 0x180 */
+    uint32_t reg_1a0;           /* 0x1A0 */
+    uint32_t reg_1b0;           /* 0x1B0 */
+    uint32_t reg_1e0;           /* 0x1E0 */
+    /* BLE Section (offset 0x200+) */
     uint32_t blecntl;           /* 0x200 */
     uint32_t bleversion;        /* 0x204 */
     uint32_t bleconf;           /* 0x208 */
@@ -241,97 +292,159 @@ static struct {
     uint32_t bleralptr;         /* 0x320 */
     uint32_t bleralnbdev;       /* 0x324 */
     bool initialized;
-} btdm_ble_state;
+} btdm_state;
 
-static void btdm_ble_state_init(void)
+static void btdm_state_init(void)
 {
-    if (btdm_ble_state.initialized) {
+    if (btdm_state.initialized) {
         return;
     }
-    /* Initialize with values similar to real hardware after reset */
-    btdm_ble_state.blecntl = 0x000003e0;
-    btdm_ble_state.bleversion = 0x08000900;  /* TYP=8, REL=0, UPG=9, BUILD=0 */
-    btdm_ble_state.bleconf = 0x00000000;
-    btdm_ble_state.bleintcntl = 0x00000000;
-    btdm_ble_state.bleintstat = 0x00000000;
-    btdm_ble_state.bleintrawstat = 0x00000001;
-    btdm_ble_state.bleintack = 0x00000000;
-    btdm_ble_state.blebasetimecnt = 0x00000000;
-    btdm_ble_state.blefinetimecnt = 0x00000000;
-    btdm_ble_state.blebdaddrl = 0x00000000;
-    btdm_ble_state.blebdaddru = 0x00000000;
-    btdm_ble_state.blecurrentrxdescptr = 0x00000000;
-    btdm_ble_state.blediagcntl = 0x00000000;
-    btdm_ble_state.blediagstat = 0x00000000;
-    btdm_ble_state.bleerrortypestat = 0x00000000;
-    btdm_ble_state.bleradiocntl0 = 0x00000002;
-    btdm_ble_state.bleradiocntl1 = 0x00020000;
-    btdm_ble_state.bleradiopwrupdn = 0x00d203d2;
-    btdm_ble_state.bleadvchmap = 0x00000007;  /* All 3 advertising channels */
-    btdm_ble_state.bleadvtim = 0x00000000;
-    btdm_ble_state.blewlpubaddrptr = 0x00000000;
-    btdm_ble_state.blewlprivaddrptr = 0x00000000;
-    btdm_ble_state.blewlnbdev = 0x00000000;
-    btdm_ble_state.bleaescntl = 0x00000000;
-    btdm_ble_state.bleaesptr = 0x00000000;
-    btdm_ble_state.blerftestcntl = 0x00000000;
-    btdm_ble_state.blerftesttxstat = 0x00000000;
-    btdm_ble_state.blerftestrxstat = 0x00000000;
-    btdm_ble_state.bletimgencntl = 0x81be00d2;
-    btdm_ble_state.blecoexifcntl0 = 0x00000000;
-    btdm_ble_state.bleralptr = 0x00000000;
-    btdm_ble_state.bleralnbdev = 0x00000000;
-    btdm_ble_state.initialized = true;
+    /* Initialize BR/EDR section with values from real hardware */
+    btdm_state.btcntl = 0x0000710c;
+    btdm_state.btversion = 0x08000b00;
+    btdm_state.btintcntl = 0x0003c802;
+    btdm_state.btintstat = 0x00000000;
+    btdm_state.btintrawstat = 0x00000001;
+    btdm_state.btintack = 0x00000000;
+    btdm_state.reg_01c = 0x00000000;
+    btdm_state.reg_028 = 0x00000000;
+    btdm_state.reg_02c = 0x00000000;
+    btdm_state.reg_030 = 0x00000000;
+    btdm_state.reg_034 = 0x00000000;
+    btdm_state.reg_038 = 0x00000000;
+    btdm_state.reg_040 = 0x00000000;
+    btdm_state.reg_044 = 0x00000000;
+    btdm_state.reg_060 = 0x00000000;
+    btdm_state.reg_064 = 0x00000000;
+    btdm_state.reg_070 = 0x00000000;
+    btdm_state.reg_074 = 0x00000000;
+    btdm_state.reg_080 = 0x00000000;
+    btdm_state.reg_098 = 0x00000000;
+    btdm_state.reg_0a4 = 0x00000000;
+    btdm_state.reg_0b0 = 0x00000000;
+    btdm_state.reg_0b4 = 0x00000000;
+    btdm_state.reg_0bc = 0x00000000;
+    btdm_state.reg_140 = 0x00000000;
+    btdm_state.reg_160 = 0x00000000;
+    btdm_state.reg_180 = 0x00000000;
+    btdm_state.reg_1a0 = 0x00000000;
+    btdm_state.reg_1b0 = 0x00000000;
+    btdm_state.reg_1e0 = 0x00000000;
+    /* Initialize BLE section with values from real hardware */
+    btdm_state.blecntl = 0x000003e0;
+    btdm_state.bleversion = 0x08000900;  /* TYP=8, REL=0, UPG=9, BUILD=0 */
+    btdm_state.bleconf = 0x00000000;
+    btdm_state.bleintcntl = 0x00000000;
+    btdm_state.bleintstat = 0x00000000;
+    btdm_state.bleintrawstat = 0x00000001;
+    btdm_state.bleintack = 0x00000000;
+    btdm_state.blebasetimecnt = 0x00000000;
+    btdm_state.blefinetimecnt = 0x00000000;
+    btdm_state.blebdaddrl = 0x00000000;
+    btdm_state.blebdaddru = 0x00000000;
+    btdm_state.blecurrentrxdescptr = 0x00000000;
+    btdm_state.blediagcntl = 0x00000000;
+    btdm_state.blediagstat = 0x00000000;
+    btdm_state.bleerrortypestat = 0x00000000;
+    btdm_state.bleradiocntl0 = 0x00000002;
+    btdm_state.bleradiocntl1 = 0x00020000;
+    btdm_state.bleradiopwrupdn = 0x00d203d2;
+    btdm_state.bleadvchmap = 0x00000007;  /* All 3 advertising channels */
+    btdm_state.bleadvtim = 0x00000000;
+    btdm_state.blewlpubaddrptr = 0x00000000;
+    btdm_state.blewlprivaddrptr = 0x00000000;
+    btdm_state.blewlnbdev = 0x00000000;
+    btdm_state.bleaescntl = 0x00000000;
+    btdm_state.bleaesptr = 0x00000000;
+    btdm_state.blerftestcntl = 0x00000000;
+    btdm_state.blerftesttxstat = 0x00000000;
+    btdm_state.blerftestrxstat = 0x00000000;
+    btdm_state.bletimgencntl = 0x81be00d2;
+    btdm_state.blecoexifcntl0 = 0x00000000;
+    btdm_state.bleralptr = 0x00000000;
+    btdm_state.bleralnbdev = 0x00000000;
+    btdm_state.initialized = true;
 }
 
 static uint64_t phy_mmio_read(void *opaque, hwaddr addr, unsigned size)
 {
     uint32_t val = 0;
 
-    btdm_ble_state_init();
+    btdm_state_init();
 
     switch (addr) {
+    /* BR/EDR Section (offset 0x000-0x1FF) */
+    case 0x000: val = btdm_state.btcntl; break;
+    case 0x004: val = btdm_state.btversion; break;
+    case 0x00C: val = btdm_state.btintcntl; break;
+    case 0x010: val = btdm_state.btintstat; break;
+    case 0x014: val = btdm_state.btintrawstat; break;
+    case 0x018: val = btdm_state.btintack; break;
+    case 0x01C: val = btdm_state.reg_01c; break;
+    case 0x028: val = btdm_state.reg_028; break;
+    case 0x02C: val = btdm_state.reg_02c; break;
+    case 0x030: val = btdm_state.reg_030; break;
+    case 0x034: val = btdm_state.reg_034; break;
+    case 0x038: val = btdm_state.reg_038; break;
+    case 0x040: val = btdm_state.reg_040; break;
+    case 0x044: val = btdm_state.reg_044; break;
+    case 0x060: val = btdm_state.reg_060; break;
+    case 0x064: val = btdm_state.reg_064; break;
+    case 0x070: val = btdm_state.reg_070; break;
+    case 0x074: val = btdm_state.reg_074; break;
+    case 0x080: val = btdm_state.reg_080; break;
+    case 0x098: val = btdm_state.reg_098; break;
+    case 0x0A4: val = btdm_state.reg_0a4; break;
+    case 0x0B0: val = btdm_state.reg_0b0; break;
+    case 0x0B4: val = btdm_state.reg_0b4; break;
+    case 0x0BC: val = btdm_state.reg_0bc; break;
+    case 0x140: val = btdm_state.reg_140; break;
+    case 0x160: val = btdm_state.reg_160; break;
+    case 0x180: val = btdm_state.reg_180; break;
+    case 0x1A0: val = btdm_state.reg_1a0; break;
+    case 0x1B0: val = btdm_state.reg_1b0; break;
+    case 0x1E0: val = btdm_state.reg_1e0; break;
     /* BLE Section (offset 0x200+) */
-    case 0x200: val = btdm_ble_state.blecntl; break;
-    case 0x204: val = btdm_ble_state.bleversion; break;
-    case 0x208: val = btdm_ble_state.bleconf; break;
-    case 0x20C: val = btdm_ble_state.bleintcntl; break;
-    case 0x210: val = btdm_ble_state.bleintstat; break;
-    case 0x214: val = btdm_ble_state.bleintrawstat; break;
-    case 0x218: val = btdm_ble_state.bleintack; break;
-    case 0x21C: val = btdm_ble_state.blebasetimecnt; break;
-    case 0x220: val = btdm_ble_state.blefinetimecnt; break;
-    case 0x224: val = btdm_ble_state.blebdaddrl; break;
-    case 0x228: val = btdm_ble_state.blebdaddru; break;
-    case 0x22C: val = btdm_ble_state.blecurrentrxdescptr; break;
-    case 0x250: val = btdm_ble_state.blediagcntl; break;
-    case 0x254: val = btdm_ble_state.blediagstat; break;
-    case 0x260: val = btdm_ble_state.bleerrortypestat; break;
-    case 0x270: val = btdm_ble_state.bleradiocntl0; break;
-    case 0x274: val = btdm_ble_state.bleradiocntl1; break;
-    case 0x280: val = btdm_ble_state.bleradiopwrupdn; break;
-    case 0x290: val = btdm_ble_state.bleadvchmap; break;
-    case 0x2A0: val = btdm_ble_state.bleadvtim; break;
-    case 0x2B0: val = btdm_ble_state.blewlpubaddrptr; break;
-    case 0x2B4: val = btdm_ble_state.blewlprivaddrptr; break;
-    case 0x2B8: val = btdm_ble_state.blewlnbdev; break;
-    case 0x2C0: val = btdm_ble_state.bleaescntl; break;
-    case 0x2C4: val = btdm_ble_state.bleaeskey[0]; break;
-    case 0x2C8: val = btdm_ble_state.bleaeskey[1]; break;
-    case 0x2CC: val = btdm_ble_state.bleaeskey[2]; break;
-    case 0x2D0: val = btdm_ble_state.bleaeskey[3]; break;
-    case 0x2D4: val = btdm_ble_state.bleaesptr; break;
-    case 0x2E0: val = btdm_ble_state.blerftestcntl; break;
-    case 0x2E4: val = btdm_ble_state.blerftesttxstat; break;
-    case 0x2E8: val = btdm_ble_state.blerftestrxstat; break;
-    case 0x2F0: val = btdm_ble_state.bletimgencntl; break;
-    case 0x300: val = btdm_ble_state.blecoexifcntl0; break;
-    case 0x320: val = btdm_ble_state.bleralptr; break;
-    case 0x324: val = btdm_ble_state.bleralnbdev; break;
+    case 0x200: val = btdm_state.blecntl; break;
+    case 0x204: val = btdm_state.bleversion; break;
+    case 0x208: val = btdm_state.bleconf; break;
+    case 0x20C: val = btdm_state.bleintcntl; break;
+    case 0x210: val = btdm_state.bleintstat; break;
+    case 0x214: val = btdm_state.bleintrawstat; break;
+    case 0x218: val = btdm_state.bleintack; break;
+    case 0x21C: val = btdm_state.blebasetimecnt; break;
+    case 0x220: val = btdm_state.blefinetimecnt; break;
+    case 0x224: val = btdm_state.blebdaddrl; break;
+    case 0x228: val = btdm_state.blebdaddru; break;
+    case 0x22C: val = btdm_state.blecurrentrxdescptr; break;
+    case 0x250: val = btdm_state.blediagcntl; break;
+    case 0x254: val = btdm_state.blediagstat; break;
+    case 0x260: val = btdm_state.bleerrortypestat; break;
+    case 0x270: val = btdm_state.bleradiocntl0; break;
+    case 0x274: val = btdm_state.bleradiocntl1; break;
+    case 0x280: val = btdm_state.bleradiopwrupdn; break;
+    case 0x290: val = btdm_state.bleadvchmap; break;
+    case 0x2A0: val = btdm_state.bleadvtim; break;
+    case 0x2B0: val = btdm_state.blewlpubaddrptr; break;
+    case 0x2B4: val = btdm_state.blewlprivaddrptr; break;
+    case 0x2B8: val = btdm_state.blewlnbdev; break;
+    case 0x2C0: val = btdm_state.bleaescntl; break;
+    case 0x2C4: val = btdm_state.bleaeskey[0]; break;
+    case 0x2C8: val = btdm_state.bleaeskey[1]; break;
+    case 0x2CC: val = btdm_state.bleaeskey[2]; break;
+    case 0x2D0: val = btdm_state.bleaeskey[3]; break;
+    case 0x2D4: val = btdm_state.bleaesptr; break;
+    case 0x2E0: val = btdm_state.blerftestcntl; break;
+    case 0x2E4: val = btdm_state.blerftesttxstat; break;
+    case 0x2E8: val = btdm_state.blerftestrxstat; break;
+    case 0x2F0: val = btdm_state.bletimgencntl; break;
+    case 0x300: val = btdm_state.blecoexifcntl0; break;
+    case 0x320: val = btdm_state.bleralptr; break;
+    case 0x324: val = btdm_state.bleralnbdev; break;
     default:
         /* Return 0 for unknown registers instead of 0xffffffff */
         val = 0;
-        qemu_log_mask(LOG_UNIMP, "PHY READ: unhandled offset 0x%" HWADDR_PRIx
+        qemu_log_mask(LOG_UNIMP, "BTDM READ: unhandled offset 0x%" HWADDR_PRIx
                       " (size %u)\n", addr, size);
         break;
     }
@@ -341,52 +454,89 @@ static uint64_t phy_mmio_read(void *opaque, hwaddr addr, unsigned size)
 
 static void phy_mmio_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
 {
-    btdm_ble_state_init();
+    btdm_state_init();
 
     switch (addr) {
-    case 0x200: 
-        btdm_ble_state.blecntl = val;
+    /* BR/EDR Section (offset 0x000-0x1FF) */
+    case 0x000: 
+        btdm_state.btcntl = val;
         if (val & (1 << 31)) {
-            qemu_log("PHY: Guest requested BLE Master Soft Reset\n");
+            qemu_log("BTDM: Guest requested BR/EDR Master Soft Reset\n");
         }
         break;
-    case 0x204: btdm_ble_state.bleversion = val; break;
-    case 0x208: btdm_ble_state.bleconf = val; break;
-    case 0x20C: btdm_ble_state.bleintcntl = val; break;
-    case 0x210: btdm_ble_state.bleintstat = val; break;
-    case 0x214: btdm_ble_state.bleintrawstat = val; break;
-    case 0x218: btdm_ble_state.bleintack = val; break;
-    case 0x21C: btdm_ble_state.blebasetimecnt = val; break;
-    case 0x220: btdm_ble_state.blefinetimecnt = val; break;
-    case 0x224: btdm_ble_state.blebdaddrl = val; break;
-    case 0x228: btdm_ble_state.blebdaddru = val; break;
-    case 0x22C: btdm_ble_state.blecurrentrxdescptr = val; break;
-    case 0x250: btdm_ble_state.blediagcntl = val; break;
-    case 0x254: btdm_ble_state.blediagstat = val; break;
-    case 0x260: btdm_ble_state.bleerrortypestat = val; break;
-    case 0x270: btdm_ble_state.bleradiocntl0 = val; break;
-    case 0x274: btdm_ble_state.bleradiocntl1 = val; break;
-    case 0x280: btdm_ble_state.bleradiopwrupdn = val; break;
-    case 0x290: btdm_ble_state.bleadvchmap = val; break;
-    case 0x2A0: btdm_ble_state.bleadvtim = val; break;
-    case 0x2B0: btdm_ble_state.blewlpubaddrptr = val; break;
-    case 0x2B4: btdm_ble_state.blewlprivaddrptr = val; break;
-    case 0x2B8: btdm_ble_state.blewlnbdev = val; break;
-    case 0x2C0: btdm_ble_state.bleaescntl = val; break;
-    case 0x2C4: btdm_ble_state.bleaeskey[0] = val; break;
-    case 0x2C8: btdm_ble_state.bleaeskey[1] = val; break;
-    case 0x2CC: btdm_ble_state.bleaeskey[2] = val; break;
-    case 0x2D0: btdm_ble_state.bleaeskey[3] = val; break;
-    case 0x2D4: btdm_ble_state.bleaesptr = val; break;
-    case 0x2E0: btdm_ble_state.blerftestcntl = val; break;
-    case 0x2E4: btdm_ble_state.blerftesttxstat = val; break;
-    case 0x2E8: btdm_ble_state.blerftestrxstat = val; break;
-    case 0x2F0: btdm_ble_state.bletimgencntl = val; break;
-    case 0x300: btdm_ble_state.blecoexifcntl0 = val; break;
-    case 0x320: btdm_ble_state.bleralptr = val; break;
-    case 0x324: btdm_ble_state.bleralnbdev = val; break;
+    case 0x004: btdm_state.btversion = val; break;
+    case 0x00C: btdm_state.btintcntl = val; break;
+    case 0x010: btdm_state.btintstat = val; break;
+    case 0x014: btdm_state.btintrawstat = val; break;
+    case 0x018: btdm_state.btintack = val; break;
+    case 0x01C: btdm_state.reg_01c = val; break;
+    case 0x028: btdm_state.reg_028 = val; break;
+    case 0x02C: btdm_state.reg_02c = val; break;
+    case 0x030: btdm_state.reg_030 = val; break;
+    case 0x034: btdm_state.reg_034 = val; break;
+    case 0x038: btdm_state.reg_038 = val; break;
+    case 0x040: btdm_state.reg_040 = val; break;
+    case 0x044: btdm_state.reg_044 = val; break;
+    case 0x060: btdm_state.reg_060 = val; break;
+    case 0x064: btdm_state.reg_064 = val; break;
+    case 0x070: btdm_state.reg_070 = val; break;
+    case 0x074: btdm_state.reg_074 = val; break;
+    case 0x080: btdm_state.reg_080 = val; break;
+    case 0x098: btdm_state.reg_098 = val; break;
+    case 0x0A4: btdm_state.reg_0a4 = val; break;
+    case 0x0B0: btdm_state.reg_0b0 = val; break;
+    case 0x0B4: btdm_state.reg_0b4 = val; break;
+    case 0x0BC: btdm_state.reg_0bc = val; break;
+    case 0x140: btdm_state.reg_140 = val; break;
+    case 0x160: btdm_state.reg_160 = val; break;
+    case 0x180: btdm_state.reg_180 = val; break;
+    case 0x1A0: btdm_state.reg_1a0 = val; break;
+    case 0x1B0: btdm_state.reg_1b0 = val; break;
+    case 0x1E0: btdm_state.reg_1e0 = val; break;
+    /* BLE Section (offset 0x200+) */
+    case 0x200: 
+        btdm_state.blecntl = val;
+        if (val & (1 << 31)) {
+            qemu_log("BTDM: Guest requested BLE Master Soft Reset\n");
+        }
+        break;
+    case 0x204: btdm_state.bleversion = val; break;
+    case 0x208: btdm_state.bleconf = val; break;
+    case 0x20C: btdm_state.bleintcntl = val; break;
+    case 0x210: btdm_state.bleintstat = val; break;
+    case 0x214: btdm_state.bleintrawstat = val; break;
+    case 0x218: btdm_state.bleintack = val; break;
+    case 0x21C: btdm_state.blebasetimecnt = val; break;
+    case 0x220: btdm_state.blefinetimecnt = val; break;
+    case 0x224: btdm_state.blebdaddrl = val; break;
+    case 0x228: btdm_state.blebdaddru = val; break;
+    case 0x22C: btdm_state.blecurrentrxdescptr = val; break;
+    case 0x250: btdm_state.blediagcntl = val; break;
+    case 0x254: btdm_state.blediagstat = val; break;
+    case 0x260: btdm_state.bleerrortypestat = val; break;
+    case 0x270: btdm_state.bleradiocntl0 = val; break;
+    case 0x274: btdm_state.bleradiocntl1 = val; break;
+    case 0x280: btdm_state.bleradiopwrupdn = val; break;
+    case 0x290: btdm_state.bleadvchmap = val; break;
+    case 0x2A0: btdm_state.bleadvtim = val; break;
+    case 0x2B0: btdm_state.blewlpubaddrptr = val; break;
+    case 0x2B4: btdm_state.blewlprivaddrptr = val; break;
+    case 0x2B8: btdm_state.blewlnbdev = val; break;
+    case 0x2C0: btdm_state.bleaescntl = val; break;
+    case 0x2C4: btdm_state.bleaeskey[0] = val; break;
+    case 0x2C8: btdm_state.bleaeskey[1] = val; break;
+    case 0x2CC: btdm_state.bleaeskey[2] = val; break;
+    case 0x2D0: btdm_state.bleaeskey[3] = val; break;
+    case 0x2D4: btdm_state.bleaesptr = val; break;
+    case 0x2E0: btdm_state.blerftestcntl = val; break;
+    case 0x2E4: btdm_state.blerftesttxstat = val; break;
+    case 0x2E8: btdm_state.blerftestrxstat = val; break;
+    case 0x2F0: btdm_state.bletimgencntl = val; break;
+    case 0x300: btdm_state.blecoexifcntl0 = val; break;
+    case 0x320: btdm_state.bleralptr = val; break;
+    case 0x324: btdm_state.bleralnbdev = val; break;
     default:
-        qemu_log_mask(LOG_UNIMP, "PHY WRITE: unhandled offset 0x%" HWADDR_PRIx
+        qemu_log_mask(LOG_UNIMP, "BTDM WRITE: unhandled offset 0x%" HWADDR_PRIx
                       " (size %u) <- 0x%08" PRIx64 "\n", addr, size, val);
         break;
     }
@@ -987,21 +1137,16 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
     esp32_soc_add_unimp_device(sys_mem, "esp32.i2s0", DR_REG_I2S_BASE, 0x1000,0);
     esp32_soc_add_unimp_device(sys_mem, "esp32.i2s1", DR_REG_I2S1_BASE, 0x1000,0);
     esp32_soc_add_unimp_device(sys_mem, "esp32.fe2", DR_REG_FE2_BASE, 0x1000, -1);
-    //esp32_soc_add_unimp_device(sys_mem, "esp32.chipv7_phy", DR_REG_PHY_BASE, 0x1000,-1);
+    
+    /* Note: DR_REG_PHY_BASE (0x3ff71000) and DR_REG_BT_BASE (0x3ff51000) are handled
+     * by bt_phy_io (phy_mmio_ops) and bt_lc_io (bt_controller_ops) respectively,
+     * which are initialized earlier in this function. */
+    
     esp32_soc_add_unimp_device(sys_mem, "esp32.chipv7_phyb", DR_REG_WDEV_BASE, 0x1000,0);
     esp32_soc_add_unimp_device(sys_mem, "esp32.unknown_wifi", DR_REG_NRX_BASE  , 0x1000,-1);
     esp32_soc_add_unimp_device(sys_mem, "esp32.unknown_wifi1", DR_REG_BB_BASE , 0x1000,-1);
     /* Extended WIFI/PHY region - covers 0x3ff73000-0x3ff73fff + extended area for phy_chip_v7 */
-    esp32_soc_add_unimp_device(sys_mem, "esp32.wifi_phy", DR_REG_WIFI_BASE, 0x1000, 0);
-    esp32_soc_add_unimp_device(sys_mem, "esp32.bt", DR_REG_BT_BASE, 0x1000, 0);
-
-    /* Register the BTDM peripheral with logging callbacks */
-    MemoryRegion *btdm_io = g_new(MemoryRegion, 1);
-    memory_region_init_io(btdm_io, OBJECT(dev), &btdm_ops, s, "esp32.btdm", 0x1000);
-    memory_region_add_subregion(sys_mem, DR_REG_BT_BASE, btdm_io);
-
-    /* Log the initialization */
-    qemu_log("BTDM RivieraWaves IP core mapped at 0x%08x\n", (uint32_t)DR_REG_BT_BASE);
+    esp32_soc_add_unimp_device(sys_mem, "esp32.wifi_phy", DR_REG_WIFI_BASE, 0x1000, 1);
 
 
     /* st7789v is attached to SPI2 and SPI3 so the both HSPI and VSPI will work,
