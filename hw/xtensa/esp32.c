@@ -109,115 +109,6 @@ static const MemoryRegionOps btdm_em_ops = {
     .endianness = DEVICE_NATIVE_ENDIAN,
 };
 
-/* BT Link Controller (0x3ff51000) state */
-static struct {
-    uint32_t btcntl;        /* 0x000 */
-    uint32_t btversion;     /* 0x004 */
-    uint32_t btintcntl;     /* 0x00C */
-    uint32_t btintstat;     /* 0x010 */
-    uint32_t btintrawstat;  /* 0x014 */
-    uint32_t btintack;      /* 0x018 */
-    uint32_t reg_02c;       /* 0x02C - unknown, used in ld_reset */
-    uint32_t reg_080;       /* 0x080 - unknown, used in ld_reset */
-    uint32_t reg_140;       /* 0x140 - unknown, used in ld_reset */
-    uint32_t reg_160;       /* 0x160 - unknown, used in ld_reset */
-    uint32_t reg_180;       /* 0x180 - unknown, used in ld_reset */
-    uint32_t reg_1a0;       /* 0x1A0 - unknown, used in ld_reset */
-    uint32_t reg_1b0;       /* 0x1B0 - unknown, used in ld_reset */
-    bool initialized;
-} bt_lc_state;
-
-static void bt_lc_state_init(void)
-{
-    if (bt_lc_state.initialized) {
-        return;
-    }
-    bt_lc_state.btcntl = 0x0000710c;
-    bt_lc_state.btversion = 0x08000b00;
-    bt_lc_state.btintcntl = 0x0003c802;
-    bt_lc_state.btintstat = 0x00000000;
-    bt_lc_state.btintrawstat = 0x00000001;
-    bt_lc_state.btintack = 0x00000000;
-    bt_lc_state.reg_02c = 0x00000000;
-    bt_lc_state.reg_080 = 0x00000000;
-    bt_lc_state.reg_140 = 0x00000000;
-    bt_lc_state.reg_160 = 0x00000000;
-    bt_lc_state.reg_180 = 0x00000000;
-    bt_lc_state.reg_1a0 = 0x00000000;
-    bt_lc_state.reg_1b0 = 0x00000000;
-    bt_lc_state.initialized = true;
-}
-
-/* BT Link Controller (0x3ff51000) read/write handlers */
-static uint64_t bt_controller_read(void *opaque, hwaddr addr, unsigned size)
-{
-    uint32_t val = 0;
-
-    bt_lc_state_init();
-
-    switch (addr) {
-    case 0x000: val = bt_lc_state.btcntl; break;
-    case 0x004: val = bt_lc_state.btversion; break;
-    case 0x00C: val = bt_lc_state.btintcntl; break;
-    case 0x010: val = bt_lc_state.btintstat; break;
-    case 0x014: val = bt_lc_state.btintrawstat; break;
-    case 0x018: val = bt_lc_state.btintack; break;
-    case 0x02C: val = bt_lc_state.reg_02c; break;
-    case 0x080: val = bt_lc_state.reg_080; break;
-    case 0x140: val = bt_lc_state.reg_140; break;
-    case 0x160: val = bt_lc_state.reg_160; break;
-    case 0x180: val = bt_lc_state.reg_180; break;
-    case 0x1A0: val = bt_lc_state.reg_1a0; break;
-    case 0x1B0: val = bt_lc_state.reg_1b0; break;
-    default:
-        qemu_log_mask(LOG_UNIMP, "BT_LC READ: unhandled offset 0x%" HWADDR_PRIx
-                      " (size %u)\n", addr, size);
-        break;
-    }
-
-    return val;
-}
-
-static void bt_controller_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
-{
-    bt_lc_state_init();
-
-    switch (addr) {
-    case 0x000: 
-        bt_lc_state.btcntl = val;
-        if (val & (1 << 31)) {
-            qemu_log("BT_LC: Guest requested BR/EDR Soft Reset\n");
-        }
-        break;
-    case 0x004: bt_lc_state.btversion = val; break;
-    case 0x00C: bt_lc_state.btintcntl = val; break;
-    case 0x010: bt_lc_state.btintstat = val; break;
-    case 0x014: bt_lc_state.btintrawstat = val; break;
-    case 0x018: bt_lc_state.btintack = val; break;
-    case 0x02C: bt_lc_state.reg_02c = val; break;
-    case 0x080: bt_lc_state.reg_080 = val; break;
-    case 0x140: bt_lc_state.reg_140 = val; break;
-    case 0x160: bt_lc_state.reg_160 = val; break;
-    case 0x180: bt_lc_state.reg_180 = val; break;
-    case 0x1A0: bt_lc_state.reg_1a0 = val; break;
-    case 0x1B0: bt_lc_state.reg_1b0 = val; break;
-    default:
-        qemu_log_mask(LOG_UNIMP, "BT_LC WRITE: unhandled offset 0x%" HWADDR_PRIx
-                      " (size %u) <- 0x%08" PRIx64 "\n", addr, size, val);
-        break;
-    }
-}
-
-static const MemoryRegionOps bt_controller_ops = {
-    .read = bt_controller_read,
-    .write = bt_controller_write,
-    .endianness = DEVICE_NATIVE_ENDIAN,
-    .valid = {
-        .min_access_size = 4,
-        .max_access_size = 4,
-    },
-};
-
 /* PHY/Baseband / BTDM BLE registers (0x3ff71000) read/write handlers 
  * This region contains the RivieraWaves BLE controller registers.
  * Offsets are relative to 0x3ff71000 (DR_REG_PHY_BASE).
@@ -389,7 +280,10 @@ static uint64_t phy_mmio_read(void *opaque, hwaddr addr, unsigned size)
 
     switch (addr) {
     /* BR/EDR Section (offset 0x000-0x1FF) */
-    case 0x000: val = btdm_state.btcntl; break;
+    case 0x000:
+        /* BTCNTL - bits 31 and 30 auto-clear to indicate reset/operation complete */
+        val = btdm_state.btcntl & 0x3FFFFFFF;  /* Always read with bits 31,30 cleared */
+        break;
     case 0x004: val = btdm_state.btversion; break;
     case 0x00C: val = btdm_state.btintcntl; break;
     case 0x010: val = btdm_state.btintstat; break;
@@ -484,9 +378,13 @@ static void phy_mmio_write(void *opaque, hwaddr addr, uint64_t val, unsigned siz
     switch (addr) {
     /* BR/EDR Section (offset 0x000-0x1FF) */
     case 0x000: 
+        /* BTCNTL - store value, bits 31/30 will auto-clear on read */
         btdm_state.btcntl = val;
         if (val & (1 << 31)) {
-            qemu_log("BTDM: Guest requested BR/EDR Master Soft Reset\n");
+            qemu_log_mask(LOG_GUEST_ERROR, "BTDM: Guest set BTCNTL bit 31 (soft reset)\n");
+        }
+        if (val & (1 << 30)) {
+            qemu_log_mask(LOG_GUEST_ERROR, "BTDM: Guest set BTCNTL bit 30\n");
         }
         break;
     case 0x004: btdm_state.btversion = val; break;
@@ -903,10 +801,15 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
     memory_region_init_alias(rtcfast_d, NULL, "esp32.rtcfast_d", rtcfast_i, 0, memmap[ESP32_MEMREGION_RTCFAST_D].size);
     memory_region_add_subregion(&s->cpu_specific_mem[0], memmap[ESP32_MEMREGION_RTCFAST_D].base, rtcfast_d);
 
-    /* 1. Link Controller (0x3ff51000) */
+    /* 1. Link Controller / BT RF registers (0x3ff51000) - RAM for RX filter init etc */
     MemoryRegion *bt_lc_io = g_new(MemoryRegion, 1);
-    memory_region_init_io(bt_lc_io, OBJECT(dev), &bt_controller_ops, s, "esp32.bt_lc", 0x1000);
+    memory_region_init_ram(bt_lc_io, OBJECT(dev), "esp32.bt_lc", 0x1000, &error_fatal);
     memory_region_add_subregion(sys_mem, DR_REG_BT_BASE, bt_lc_io);
+
+    /* 1b. BT RF/Modem registers (0x3ff5c000) - RAM for filter coefficients etc */
+    MemoryRegion *bt_rf_io = g_new(MemoryRegion, 1);
+    memory_region_init_ram(bt_rf_io, OBJECT(dev), "esp32.bt_rf", 0x1000, &error_fatal);
+    memory_region_add_subregion(sys_mem, 0x3ff5c000, bt_rf_io);
 
     /* 2. Radio PHY / Baseband (0x3ff71000) */
     MemoryRegion *bt_phy_io = g_new(MemoryRegion, 1);
