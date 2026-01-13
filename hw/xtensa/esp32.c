@@ -330,7 +330,10 @@ static uint64_t phy_mmio_read(void *opaque, hwaddr addr, unsigned size)
     case 0x210: val = btdm_state.bleintstat; break;
     case 0x214: val = btdm_state.bleintrawstat; break;
     case 0x218: val = btdm_state.bleintack; break;
-    case 0x21C: val = btdm_state.blebasetimecnt; break;
+    case 0x21C:
+        /* BLEBASETIMECNT - bit 31 auto-clears to indicate operation complete */
+        val = btdm_state.blebasetimecnt & 0x7FFFFFFF;
+        break;
     case 0x220: val = btdm_state.blefinetimecnt; break;
     case 0x224: val = btdm_state.blebdaddrl; break;
     case 0x228: val = btdm_state.blebdaddru; break;
