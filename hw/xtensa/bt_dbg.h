@@ -205,6 +205,7 @@ typedef struct __attribute__((packed)) {
 
 /* 
  * Known EM regions (offsets from 0x3FFB0000)
+ * Total EM size is 32KB (0x8000 bytes)
  */
 #define EM_NVDS_OFFSET          0x0000  /* NVDS magic at start */
 #define EM_BT_RXDESC_OFFSET     0x0800  /* BT RX descriptors */
@@ -214,6 +215,11 @@ typedef struct __attribute__((packed)) {
 #define EM_BLE_CS_OFFSET        0x2800  /* BLE Control Structures */
 #define EM_KEY_OFFSET           0x3000  /* Encryption keys */
 #define EM_WHITELIST_OFFSET     0x3800  /* Whitelist entries */
+#define EM_BT_ET_OFFSET         0x4000  /* BT Exchange Table (16 entries) */
+#define EM_SEMA_OFFSET          0x5000  /* Semaphores/Mutexes */
+#define EM_HEAP_OFFSET          0x6000  /* BTDM heap / misc structures */
+#define EM_RTOS_OFFSET          0x7800  /* FreeRTOS TCB/stack area */
+#define EM_END_OFFSET           0x8000  /* End of EM */
 
 /* Debug helper macros */
 #define EM_REGION_NAME(off) \
@@ -224,7 +230,47 @@ typedef struct __attribute__((packed)) {
      (off) < 0x2800 ? "BLE_TXDESC" : \
      (off) < 0x3000 ? "BLE_CS" : \
      (off) < 0x3800 ? "KEY" : \
-     (off) < 0x4000 ? "WHITELIST" : "UNKNOWN")
+     (off) < 0x4000 ? "WHITELIST" : \
+     (off) < 0x5000 ? "BT_ET" : \
+     (off) < 0x6000 ? "SEMA" : \
+     (off) < 0x7800 ? "HEAP" : \
+     (off) < 0x8000 ? "RTOS" : "INVALID")
+
+/*
+ * Known RTOS/SEMA field annotations
+ * FreeRTOS TCB structure fields and RivieraWaves kernel objects
+ */
+static inline const char *em_field_comment(uint32_t off, uint32_t val)
+{
+    /* Spinlock magic values - check these FIRST */
+    if (val == 0xb33fffff) {
+        return " ; SPINLOCK_FREE";
+    }
+    if (val == 0x0000cdcd) {
+        return " ; SPINLOCK_TAKEN";
+    }
+    /* Stack canary */
+    if (val == 0xa5a5a5a5) {
+        return " ; STACK_CANARY";
+    }
+    /* Check if value looks like a function pointer (bit 31 set = windowed call) */
+    if ((val & 0xf0000000) == 0x80000000) {
+        return " ; func_ptr";
+    }
+    /* Check if value looks like an EM pointer (0x3ffb0000-0x3ffb8000) */
+    if ((val >= 0x3ffb0000) && (val < 0x3ffb8000)) {
+        return " ; em_ptr";
+    }
+    /* Check if value looks like a DRAM pointer (0x3ffxxxxx) */
+    if ((val >= 0x3ff00000) && (val < 0x40000000)) {
+        return " ; dram_ptr";
+    }
+    /* Check if value looks like an IRAM/ROM pointer (0x400xxxxx) */
+    if ((val >= 0x40000000) && (val < 0x50000000)) {
+        return " ; code_ptr";
+    }
+    return "";
+}
 
 /* Packet type names (for BT header) */
 static inline const char *bt_pkt_type_name(uint8_t type)

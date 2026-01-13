@@ -87,8 +87,8 @@ static const struct MemmapEntry {
 #include "bt_dbg.h"
 #include "qemu/timer.h"
 
-/* Debug level for EM access logging (0=off, 1=regions, 2=all, 3=verbose+desc) */
-static int btdm_em_debug_level = 3;
+/* Debug level for EM access logging (0=off, 1=NVDS only, 2=annotated, 3=verbose+desc) */
+static int btdm_em_debug_level = 2;
 
 /* BLE interrupt bits for BLEINTRAWSTAT/BLEINTSTAT */
 #define BLE_CSCNT_INTSTAT_BIT       (1 << 0)   /* Clock counter wrap */
@@ -120,8 +120,8 @@ static uint64_t btdm_em_read(void *opaque, hwaddr addr, unsigned size) {
     memcpy(&val, em_ptr + addr, size);
     
     if (btdm_em_debug_level >= 2) {
-        fprintf(stderr, "EM_RD [%s] 0x%04" HWADDR_PRIx " (%d) -> 0x%0*x\n",
-                 EM_REGION_NAME(addr), addr, size, size*2, val);
+        fprintf(stderr, "EM_RD [%s] 0x%04" HWADDR_PRIx " (%d) -> 0x%0*x%s\n",
+                 EM_REGION_NAME(addr), addr, size, size*2, val, em_field_comment(addr, val));
     } else if (btdm_em_debug_level >= 1 && addr < 0x10) {
         /* Always log NVDS magic reads */
         fprintf(stderr, "EM_RD NVDS 0x%04" HWADDR_PRIx " -> 0x%08x\n", addr, val);
@@ -158,8 +158,8 @@ static void btdm_em_write(void *opaque, hwaddr addr, uint64_t val, unsigned size
     memcpy(em_ptr + addr, &val, size);
     
     if (btdm_em_debug_level >= 2) {
-        fprintf(stderr, "EM_WR [%s] 0x%04" HWADDR_PRIx " (%d) <- 0x%0*" PRIx64 "\n",
-                 EM_REGION_NAME(addr), addr, size, size*2, val);
+        fprintf(stderr, "EM_WR [%s] 0x%04" HWADDR_PRIx " (%d) <- 0x%0*" PRIx64 "%s\n",
+                 EM_REGION_NAME(addr), addr, size, size*2, val, em_field_comment(addr, (uint32_t)val));
     }
     
     /* Log descriptor writes for debugging */
@@ -624,9 +624,20 @@ static void ble_timer_cb(void *opaque)
     /* Set CSCNT interrupt bit to wake up scheduler */
     btdm_state.bleintrawstat |= BLE_CSCNT_INTSTAT_BIT;
     
-    /* If CSCNT interrupt is enabled, set in INTSTAT and raise IRQ */
-    if (btdm_state.bleintcntl & BLE_CSCNT_INTSTAT_BIT) {
-        btdm_state.bleintstat |= BLE_CSCNT_INTSTAT_BIT;
+    /* Also set FINETGTINT periodically (every 4 slots) for timer target events */
+    if ((btdm_state.blebasetimecnt & 0x3) == 0) {
+        btdm_state.bleintrawstat |= BLE_FINETGTINT_INTSTAT_BIT;
+    }
+    
+    /* Set EVENTINT periodically (every 8 slots) to complete advertising/scanning events */
+    if ((btdm_state.blebasetimecnt & 0x7) == 0) {
+        btdm_state.bleintrawstat |= BLE_EVENTINT_INTSTAT_BIT;
+    }
+    
+    /* Check which enabled interrupts should fire */
+    uint32_t pending = btdm_state.bleintrawstat & btdm_state.bleintcntl;
+    if (pending) {
+        btdm_state.bleintstat |= pending;
         if (ble_timer_state.irq) {
             qemu_irq_raise(ble_timer_state.irq);
         }
