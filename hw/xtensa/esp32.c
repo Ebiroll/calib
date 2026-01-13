@@ -85,9 +85,33 @@ static const struct MemmapEntry {
 #define ESP32_SOC_RESET_ALL       (ESP32_SOC_RESET_RTC | ESP32_SOC_RESET_DIG)
 
 #include "bt_dbg.h"
+#include "qemu/timer.h"
 
 /* Debug level for EM access logging (0=off, 1=regions, 2=all, 3=verbose) */
 static int btdm_em_debug_level = 1;
+
+/* BLE interrupt bits for BLEINTRAWSTAT/BLEINTSTAT */
+#define BLE_CSCNT_INTSTAT_BIT       (1 << 0)   /* Clock counter wrap */
+#define BLE_RXINT_INTSTAT_BIT       (1 << 1)   /* RX interrupt */
+#define BLE_SLPINT_INTSTAT_BIT      (1 << 2)   /* Sleep mode interrupt */
+#define BLE_EVENTAPFAINT_INTSTAT_BIT (1 << 3)  /* Event apfa interrupt */
+#define BLE_FINETGTINT_INTSTAT_BIT  (1 << 4)   /* Fine timer target interrupt */
+#define BLE_GROSSTGTINT_INTSTAT_BIT (1 << 5)   /* Gross timer target interrupt */
+#define BLE_ERRORINT_INTSTAT_BIT    (1 << 6)   /* Error interrupt */
+#define BLE_CRYPTINT_INTSTAT_BIT    (1 << 7)   /* Encryption interrupt */
+#define BLE_EVENTINT_INTSTAT_BIT    (1 << 8)   /* Event done interrupt */
+#define BLE_SWINT_INTSTAT_BIT       (1 << 9)   /* Software interrupt */
+
+/* BLE timer state */
+static struct {
+    QEMUTimer *timer;
+    qemu_irq irq;
+    bool enabled;
+    uint64_t period_ns;
+} ble_timer_state;
+
+/* Forward declarations for BLE timer functions */
+static void ble_timer_update(void);
 
 /* Intercepts the Data Plane (Exchange Memory) */
 static uint64_t btdm_em_read(void *opaque, hwaddr addr, unsigned size) {
@@ -216,6 +240,13 @@ static struct {
     uint32_t blecoexifcntl0;    /* 0x300 */
     uint32_t bleralptr;         /* 0x320 */
     uint32_t bleralnbdev;       /* 0x324 */
+    /* RivieraWaves Interrupt Controller (offset 0x350+) */
+    uint32_t rwintcntl;         /* 0x350 - RW interrupt control */
+    uint32_t rwintstat;         /* 0x354 - RW interrupt status (returns IRQ number) */
+    uint32_t rwintrawstat;      /* 0x358 - RW raw interrupt status */
+    uint32_t rwintack;          /* 0x35C - RW interrupt acknowledge */
+    uint32_t rwintset;          /* 0x360 - RW interrupt set */
+    uint32_t rwintclr;          /* 0x364 - RW interrupt clear */
     uint32_t reg_390;           /* 0x390 */
     bool initialized;
 } btdm_state;
@@ -294,6 +325,13 @@ static void btdm_state_init(void)
     btdm_state.blecoexifcntl0 = 0x00000000;
     btdm_state.bleralptr = 0x00000000;
     btdm_state.bleralnbdev = 0x00000000;
+    /* RW Interrupt Controller - return proper IRQ numbers */
+    btdm_state.rwintcntl = 0x00000000;
+    btdm_state.rwintstat = 0x00000004;   /* ETS_BT_BB_INTR_SOURCE = 4 */
+    btdm_state.rwintrawstat = 0x00000000;
+    btdm_state.rwintack = 0x00000000;
+    btdm_state.rwintset = 0x00000000;
+    btdm_state.rwintclr = 0x00000000;
     btdm_state.reg_390 = 0x00000000;
     btdm_state.initialized = true;
 }
@@ -388,6 +426,13 @@ static uint64_t phy_mmio_read(void *opaque, hwaddr addr, unsigned size)
     case 0x300: val = btdm_state.blecoexifcntl0; break;
     case 0x320: val = btdm_state.bleralptr; break;
     case 0x324: val = btdm_state.bleralnbdev; break;
+    /* RivieraWaves Interrupt Controller */
+    case 0x350: val = btdm_state.rwintcntl; break;
+    case 0x354: val = btdm_state.rwintstat; break;  /* Returns IRQ number (4) */
+    case 0x358: val = btdm_state.rwintrawstat; break;
+    case 0x35C: val = btdm_state.rwintack; break;
+    case 0x360: val = btdm_state.rwintset; break;
+    case 0x364: val = btdm_state.rwintclr; break;
     case 0x390: val = btdm_state.reg_390; break;
     default:
         /* Return 0 for unknown registers instead of 0xffffffff */
@@ -463,14 +508,27 @@ static void phy_mmio_write(void *opaque, hwaddr addr, uint64_t val, unsigned siz
         btdm_state.blecntl = val;
         if (val & (1 << 31)) {
             qemu_log("BTDM: Guest requested BLE Master Soft Reset\n");
+            /* Auto-clear bit 31 */
+            btdm_state.blecntl &= ~(1 << 31);
         }
+        /* Update BLE timer based on enable bit */
+        ble_timer_update();
         break;
     case 0x204: btdm_state.bleversion = val; break;
     case 0x208: btdm_state.bleconf = val; break;
     case 0x20C: btdm_state.bleintcntl = val; break;
     case 0x210: btdm_state.bleintstat = val; break;
     case 0x214: btdm_state.bleintrawstat = val; break;
-    case 0x218: btdm_state.bleintack = val; break;
+    case 0x218:
+        /* BLEINTACK - writing 1 clears the corresponding interrupt bits */
+        btdm_state.bleintack = val;
+        btdm_state.bleintstat &= ~val;
+        btdm_state.bleintrawstat &= ~val;
+        /* Lower IRQ if no more interrupts pending */
+        if (ble_timer_state.irq && btdm_state.bleintstat == 0) {
+            qemu_irq_lower(ble_timer_state.irq);
+        }
+        break;
     case 0x21C: btdm_state.blebasetimecnt = val; break;
     case 0x220: btdm_state.blefinetimecnt = val; break;
     case 0x224: btdm_state.blebdaddrl = val; break;
@@ -500,6 +558,13 @@ static void phy_mmio_write(void *opaque, hwaddr addr, uint64_t val, unsigned siz
     case 0x300: btdm_state.blecoexifcntl0 = val; break;
     case 0x320: btdm_state.bleralptr = val; break;
     case 0x324: btdm_state.bleralnbdev = val; break;
+    /* RivieraWaves Interrupt Controller */
+    case 0x350: btdm_state.rwintcntl = val; break;
+    case 0x354: btdm_state.rwintstat = val; break;
+    case 0x358: btdm_state.rwintrawstat = val; break;
+    case 0x35C: btdm_state.rwintack = val; break;
+    case 0x360: btdm_state.rwintset = val; break;
+    case 0x364: btdm_state.rwintclr = val; break;
     case 0x390: btdm_state.reg_390 = val; break;
     default:
         qemu_log_mask(LOG_UNIMP, "BTDM WRITE: unhandled offset 0x%" HWADDR_PRIx
@@ -517,6 +582,64 @@ static const MemoryRegionOps phy_mmio_ops = {
         .max_access_size = 4,
     },
 };
+
+/* BLE timer callback - generates periodic interrupts for the BLE scheduler */
+static void ble_timer_cb(void *opaque)
+{
+    if (!ble_timer_state.enabled) {
+        return;
+    }
+
+    /* Increment the base time counter (simulates 625µs slots) */
+    btdm_clock_counter += 625;
+    btdm_state.blebasetimecnt = (btdm_state.blebasetimecnt + 1) & 0x07FFFFFF;
+    btdm_state.blefinetimecnt = (btdm_state.blefinetimecnt + 312) & 0x3FF;
+
+    /* Set CSCNT interrupt bit to wake up scheduler */
+    btdm_state.bleintrawstat |= BLE_CSCNT_INTSTAT_BIT;
+    
+    /* If CSCNT interrupt is enabled, set in INTSTAT and raise IRQ */
+    if (btdm_state.bleintcntl & BLE_CSCNT_INTSTAT_BIT) {
+        btdm_state.bleintstat |= BLE_CSCNT_INTSTAT_BIT;
+        if (ble_timer_state.irq) {
+            qemu_irq_raise(ble_timer_state.irq);
+        }
+    }
+
+    /* Reschedule the timer */
+    timer_mod(ble_timer_state.timer, 
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + ble_timer_state.period_ns);
+}
+
+/* Initialize BLE timer - called when BLE is enabled */
+static void ble_timer_init(qemu_irq irq)
+{
+    if (ble_timer_state.timer) {
+        return;  /* Already initialized */
+    }
+    
+    ble_timer_state.irq = irq;
+    ble_timer_state.period_ns = 625 * 1000;  /* 625µs = BLE slot time */
+    ble_timer_state.timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, ble_timer_cb, NULL);
+    ble_timer_state.enabled = false;
+}
+
+/* Start/stop BLE timer based on BLECNTL register */
+static void ble_timer_update(void)
+{
+    bool should_run = (btdm_state.blecntl & 0x1);  /* Bit 0 = RWBLE_EN */
+    
+    if (should_run && !ble_timer_state.enabled) {
+        ble_timer_state.enabled = true;
+        timer_mod(ble_timer_state.timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + ble_timer_state.period_ns);
+        qemu_log("BLE Timer: Started (period=%"PRId64"ns)\n", ble_timer_state.period_ns);
+    } else if (!should_run && ble_timer_state.enabled) {
+        ble_timer_state.enabled = false;
+        timer_del(ble_timer_state.timer);
+        qemu_log("BLE Timer: Stopped\n");
+    }
+}
 
 
 static void remove_cpu_watchpoints(XtensaCPU* xcs)
@@ -876,6 +999,13 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
     qemu_log("BTDM Interception Enabled: LC(0x%x), PHY(0x%x), EM(0x%x)\n", 
              DR_REG_BT_BASE, DR_REG_PHY_BASE, DR_REG_BT_EM_BASE);
 
+    /* Initialize BLE timer for interrupt generation - connect to BT_BB interrupt */
+    {
+        qemu_irq bt_bb_irq = qdev_get_gpio_in(DEVICE(&s->intmatrix), ETS_BT_BB_INTR_SOURCE);
+        ble_timer_init(bt_bb_irq);
+        qemu_log("BLE Timer initialized (IRQ connected to BT_BB_INTR_SOURCE=%d)\n", 
+                 ETS_BT_BB_INTR_SOURCE);
+    }
 
     for (int i = 0; i < ms->smp.cpus; ++i) {
         qdev_realize(DEVICE(&s->cpu[i]), NULL, &error_fatal);
