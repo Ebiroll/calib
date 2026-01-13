@@ -312,7 +312,6 @@ static const uint8_t GPIO_PIN_MUX_REG_OFFSET[] = {
     0x1c,0x20,0x14,0x18,0x04,0x08,0x0c,0x10,
 };
 
-
 static uint64_t esp32_gpio_read(void *opaque, hwaddr addr, unsigned int size) {
     Esp32GpioState *s = ESP32_GPIO(opaque);
     uint64_t r = 0;
@@ -387,6 +386,18 @@ static int get_triggering(int int_type, int oldval, int val) {
 }
 static void set_gpio(void *opaque, int n, int val) {
     Esp32GpioState *s = ESP32_GPIO(opaque);
+//    printf("set_gpio %x %x\n",s->rtc_pad_cfg[1],s->rtc_ext_wakeup0);
+    if(n==35 && val==0 /*&& (s->rtc_pad_cfg[1]&0x10000000)*/ && ((s->rtc_ext_wakeup0>>27)==5)) {
+        qemu_system_wakeup_request(QEMU_WAKEUP_REASON_OTHER, NULL);
+        qemu_irq_pulse(s->rtc_reset);
+        s->rtc_ext_wakeup0=0;
+        return;
+    }
+    if(n==35 && val==0 /*&& vm_get_suspended()*/) {
+        qemu_system_wakeup_request(QEMU_WAKEUP_REASON_OTHER, NULL);
+        //qemu_irq_pulse(s->rtc_reset);
+    }
+        
     if (n < 32) {
         int oldval = (s->gpio_in >> n) & 1;
         int int_type = (s->gpio_pin[n] >> 7) & 7;
@@ -453,7 +464,7 @@ static void text_console_update(void *obj) {
     Esp32GpioState *s = ESP32_GPIO(obj);
     if(!s->redraw || !qemu_console_is_visible(QEMU_CONSOLE(s->con))) return;
     s->redraw=0;
-    char connections[N_GPIOS][2][32];
+    char connections[N_GPIOS][32];
     
     DisplaySurface *surface = qemu_console_surface(QEMU_CONSOLE(s->con));
     /* clear screen */
@@ -465,11 +476,10 @@ static void text_console_update(void *obj) {
     }
 
     char str[128];
-    draw_string_x_y(surface, 0,0,(char *)"No I O Connections",YELLOW);
+    draw_string_x_y(surface, 0,0,(char *)"No I O IEOE Connections",YELLOW);
     
     for(int i=0;i<N_GPIOS;i++) {
-        connections[i][0][0]=0;
-        connections[i][1][0]=0;
+        connections[i][0]=0;
         snprintf(str,32,"%2d:",i);
         draw_string_x_y(surface, 0,i+1,str,WHITE);
         int op_en=((i<32)?s->gpio_enable>>i:s->gpio_enable1>>(i-32))&1;
@@ -488,27 +498,36 @@ static void text_console_update(void *obj) {
 
         draw_char_x_y(surface, 3,i+1,in?'1':'0',((oen_sel || mux_ie)&&!op_en)?GREEN:GREY);
         draw_char_x_y(surface, 5,i+1,out?'1':'0',((out_sel==0x100)&&op_en)?GREEN:GREY);
+        draw_char_x_y(surface, 7,i+1,mux_ie?'1':'0',WHITE);
+        char oe=out_sel?'1':'0';
+        if(out_sel!=0x100 && !oen_sel) {
+            oe='P';
+        } else {
+        //    pullup=0;
+        //    pulldown=0;
+        } 
+        draw_char_x_y(surface, 9,i+1,oe,WHITE);
 
         if(mux_func==DIRECT_GPIO) {
             if(out_sel==0x100 && op_en) {
                 snprintf(str,32,"GPIO%2d",i);
-                addconnection(connections[i][0],str);
+                addconnection(connections[i],str);
             } else {
-                if(out_sel<229 && op_en)
-                    addconnection(connections[i][0],gpio_matrix[out_sel].out);
+                if(out_sel<229)
+                    addconnection(connections[i],gpio_matrix[out_sel].out);
             }
         } else {
-            if(mux_func<6 && op_en)
-                addconnection(connections[i][0],(char *)io_mux_pins[i].functions[mux_func]);
+            if(mux_func<6 /*&& op_en*/)
+                addconnection(connections[i],(char *)io_mux_pins[i].functions[mux_func]);
         }
-      //  printf("%d: out_sel=%x iomux=%x pin=%x op_en=%d oen_sel=%d mux_func=%d mix_ie=%d\n",i,s->gpio_out_sel[i],s->iomux_regs[io_mux],s->gpio_pin[i],op_en,oen_sel,mux_func,mux_ie);
+    //    printf("%d: out_sel=%x iomux=%x pin=%x op_en=%d oen_sel=%d mux_func=%d mix_ie=%d\n",i,s->gpio_out_sel[i],s->iomux_regs[io_mux],s->gpio_pin[i],op_en,oen_sel,mux_func,mux_ie);
 
-        if((oen_sel || mux_ie) && !op_en /*&& mux_func!=2*/) {
-            addconnection(connections[i][1],(char *)io_mux_pins[i].functions[mux_func]);
-        }
-        if(pullup) addconnection(connections[i][1],"PU");
-        if(pulldown) addconnection(connections[i][1],"PD");
-        if(int_enable) addconnection(connections[i][1],int_types[int_type]);
+   //     if((oen_sel || mux_ie) && !op_en /*&& mux_func!=2*/) {
+   //         addconnection(connections[i],(char *)io_mux_pins[i].functions[mux_func]);
+   //     }
+        if(pullup) addconnection(connections[i],"PU");
+        if(pulldown) addconnection(connections[i],"PD");
+        if(int_enable) addconnection(connections[i],int_types[int_type]);
     }
     
     int i=0;
@@ -516,7 +535,9 @@ static void text_console_update(void *obj) {
         int n=gpio_matrix[i].num;
         int in_sel=FIELD_EX32(s->gpio_in_sel[n],GPIO_FUNC_IN,SEL);
         int sig_sel=FIELD_EX32(s->gpio_in_sel[n],GPIO_FUNC_IN,SIG_SEL);
-        if(in_sel<N_GPIOS /*&& mux_func==2*/) {
+        uint32_t io_mux=GPIO_PIN_MUX_REG_OFFSET[in_sel]/4;
+        uint32_t mux_func=FIELD_EX32(s->iomux_regs[io_mux],IO_MUX,MCU_SEL);
+        if(in_sel<N_GPIOS && mux_func==DIRECT_GPIO) {
       //      uint32_t oen_sel=FIELD_EX32(s->gpio_out_sel[in_sel],GPIO_FUNC_OUT,OEN_SEL);
       //      uint32_t io_mux=GPIO_PIN_MUX_REG_OFFSET[in_sel]/4;
       //      uint32_t mux_ie=FIELD_EX32(s->iomux_regs[io_mux],IO_MUX,FUN_IE);
@@ -524,22 +545,15 @@ static void text_console_update(void *obj) {
             
             if(sig_sel/* && (!oen_sel ||(oen_sel && !op_en)) && mux_ie*/) {
                 snprintf(str,32,"%s",gpio_matrix[i].in);
-                addconnection(connections[in_sel][1],str);
+                addconnection(connections[in_sel],str);
             } 
         }
         i++;
     }
     for(i=0;i<N_GPIOS;i++) {
         str[0]=0;
-        if(strlen(connections[i][0])!=0) {
-            strcat(str," Out:");
-            strcat((char *)str,(char *)(connections[i][0]));
-        }
-        if(strlen(connections[i][1])!=0) {
-            strcat(str," In:");
-            strcat(str,(char *)(connections[i][1]));
-        }
-        draw_string_x_y(surface, 6, i+1, str,WHITE);
+        strcat(str,(char *)(connections[i]));
+        draw_string_x_y(surface, 11, i+1, str,WHITE);
     }
     dpy_gfx_update_full(QEMU_CONSOLE(s->con));
 }
@@ -557,6 +571,7 @@ static uint64_t esp32_iomux_read(void *opaque, hwaddr addr, unsigned int size) {
     Esp32GpioState *s = ESP32_GPIO(opaque);
     int n=addr/4;
     if(n<N_GPIOS) {
+//        printf("IOMUX read %lx %x %d\n",addr, s->iomux_regs[n], size);
         return s->iomux_regs[n];
     }
     return 0;
@@ -569,7 +584,78 @@ static void esp32_iomux_write(void *opaque, hwaddr addr, uint64_t value,
     if(n<N_GPIOS) {
         s->iomux_regs[n]=value;
     }
-    //printf("IOMUX %lx %lx\n",addr,value);
+//    printf("IOMUX write %lx %lx %d\n",addr,value, size);
+}
+
+
+static uint64_t esp32_rtc_read(void *opaque, hwaddr addr, unsigned int size) {
+    Esp32GpioState *s = ESP32_GPIO(opaque);
+    uint64_t r=0;
+    
+    switch (addr) {
+        case A_RTC_GPIO_OUT:
+            r=s->rtc_gpio_out;
+            break;
+        case A_RTC_GPIO_IN:
+            r=s->rtc_gpio_in;
+            break;
+        case A_RTC_GPIO_PIN ... A_RTC_GPIO_PIN+17*4:
+            r=s->rtc_gpio_pin[(addr-A_RTC_GPIO_PIN)/4];
+            break;
+        case A_RTC_PAD_CFG ... A_RTC_PAD_CFG+15*4:
+            r=s->rtc_pad_cfg[(addr-A_RTC_PAD_CFG)/4];
+            break;
+        case A_RTC_DIG_PAD_HOLD:
+            r=s->rtc_dig_pad_hold;
+            break;
+        case A_RTC_EXT_WAKEUP0:
+            r=s->rtc_ext_wakeup0;
+            break;
+    }
+//    printf("RTC read %lx=%lx\n",addr,r);
+    return r;
+}
+
+static void esp32_rtc_write(void *opaque, hwaddr addr, uint64_t value,
+                             unsigned int size) {
+    Esp32GpioState *s = ESP32_GPIO(opaque);
+//    printf("RTC write %lx %lx\n",addr,value);
+    switch (addr) {
+        case A_RTC_GPIO_OUT:
+            s->rtc_gpio_out = value;
+            s->rtc_gpio_in = (s->rtc_gpio_in & ~s->rtc_gpio_enable) | (value & s->rtc_gpio_enable);
+            break;
+        case A_RTC_GPIO_OUT_W1TS:
+            s->rtc_gpio_out |= value;
+            s->rtc_gpio_in |= value;
+            break;
+        case A_RTC_GPIO_OUT_W1TC:
+            s->rtc_gpio_out &= ~value;
+            s->rtc_gpio_in &= ~value;
+            break;
+        case A_RTC_GPIO_ENABLE:
+        	s->rtc_gpio_enable = value;
+        	break;
+        case A_RTC_GPIO_ENABLE_W1TS:
+        	s->rtc_gpio_enable |= value;
+        	break;
+        case A_RTC_GPIO_ENABLE_W1TC:
+        	s->rtc_gpio_enable &= ~value;
+        	break;
+        case A_RTC_GPIO_PIN ... A_RTC_GPIO_PIN+17*4:
+            s->rtc_gpio_pin[(addr-A_RTC_GPIO_PIN)/4] = value;
+            break;
+        case A_RTC_PAD_CFG ... A_RTC_PAD_CFG+15*4:
+            s->rtc_pad_cfg[(addr-A_RTC_PAD_CFG)/4] = value;
+            break;
+        case A_RTC_DIG_PAD_HOLD:
+            s->rtc_dig_pad_hold = value;
+            break;
+        case A_RTC_EXT_WAKEUP0:
+            s->rtc_ext_wakeup0 = value;
+            break;
+    }
+   // s->rtcio_regs[addr/4]=value;
 }
 
 static void esp32_gpio_write(void *opaque, hwaddr addr, uint64_t value,
@@ -716,6 +802,12 @@ static const MemoryRegionOps iomux_ops = {
     .endianness = DEVICE_LITTLE_ENDIAN,
 };
 
+static const MemoryRegionOps rtc_ops = {
+    .read = esp32_rtc_read,
+    .write = esp32_rtc_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+};
+
 static void esp32_gpio_reset(Object *dev, ResetType type) {
     Esp32GpioState *s = ESP32_GPIO(dev);
     for(int i=0;i<256;i++) {
@@ -740,6 +832,11 @@ static void esp32_gpio_reset(Object *dev, ResetType type) {
     s->gpio_out1 = 0x0;
     s->gpio_enable = 0x0;
     s->gpio_enable1 = 0x0;
+
+ //   for(int i=0;i<64;i++) {
+ //       s->rtcio_regs[i]=0;
+ //   }
+ //   s->rtcio_regs[35] = 0x84100010;
 }
 
 static void func_gpio(void *opaque, int n, int val) {
@@ -778,11 +875,15 @@ static void esp32_gpio_init(Object *obj) {
                           TYPE_ESP32_GPIO, 0x1000);
     memory_region_init_io(&s->iomuxmem, obj, &iomux_ops, s,
                           TYPE_ESP32_GPIO, 0x1000);
+    memory_region_init_io(&s->iortcmem, obj, &rtc_ops, s,
+                          TYPE_ESP32_GPIO, 0x100);
     sysbus_init_mmio(sbd, &s->iomem);
     sysbus_init_mmio(sbd, &s->iomuxmem);
+    sysbus_init_mmio(sbd, &s->iortcmem);
     sysbus_init_irq(sbd, &s->irq);
     qdev_init_gpio_out_named(dev, &s->irq, SYSBUS_DEVICE_GPIO_IRQ, 1);
     qdev_init_gpio_out_named(dev, s->gpios, ESP32_GPIOS, 32);
+    qdev_init_gpio_out_named(dev, &s->rtc_reset, ESP32_RTCIO_RESET_GPIO, 1);
     qdev_init_gpio_in_named(dev, set_gpio, ESP32_GPIOS_IN, N_GPIOS);
     qdev_init_gpio_in_named(dev, func_gpio, ESP32_GPIOS_FUNC,1);
     s->gpio_in = 0x1;

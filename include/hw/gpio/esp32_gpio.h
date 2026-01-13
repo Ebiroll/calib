@@ -12,6 +12,9 @@
 #define ESP32_GPIO_GET_CLASS(obj)   OBJECT_GET_CLASS(Esp32GpioClass, obj, TYPE_ESP32_GPIO)
 #define ESP32_GPIO_CLASS(klass)     OBJECT_CLASS_CHECK(Esp32GpioClass, klass, TYPE_ESP32_GPIO)
 
+#define ESP32_RTCIO_RESET_GPIO   "rtcio-cpu-reset"
+
+// GPIO Registers
 REG32(GPIO_OUT, 0x04)
 REG32(GPIO_OUT_W1TS, 0x08)
 REG32(GPIO_OUT_W1TC, 0x0c)
@@ -46,12 +49,33 @@ REG32(GPIO_FUNC_IN_SEL_CFG_BASE,0x130)
 REG32(GPIO_FUNC_OUT_SEL_CFG_BASE,0x530)
     FIELD(GPIO_FUNC_OUT,SEL,0,9)
     FIELD(GPIO_FUNC_OUT,OEN_SEL,10,1)
+
+// IOMUX Registers
 REG32(IO_MUX_BASE,0x4)
     FIELD(IO_MUX,FUN_WPD,7,1)
     FIELD(IO_MUX,FUN_WPU,8,1)
     FIELD(IO_MUX,FUN_IE,9,1)
     FIELD(IO_MUX,FUN_DRV,10,2)
     FIELD(IO_MUX,MCU_SEL,12,3)
+
+// RTCIO Registers 
+REG32(RTC_GPIO_OUT,0x00)
+REG32(RTC_GPIO_OUT_W1TS,0x04)
+REG32(RTC_GPIO_OUT_W1TC,0x08)
+REG32(RTC_GPIO_ENABLE,0x0c)
+REG32(RTC_GPIO_ENABLE_W1TS,0x10)
+REG32(RTC_GPIO_ENABLE_W1TC,0x14)
+REG32(RTC_GPIO_STATUS,0x18)
+REG32(RTC_GPIO_STATUS_W1TS,0x1c)
+REG32(RTC_GPIO_STATUS_W1TC,0x20)
+REG32(RTC_GPIO_IN,0x24)
+REG32(RTC_GPIO_PIN,0x28)
+    FIELD(RTC_GPIO_PIN,INT_TYPE,7,3)
+    FIELD(RTC_GPIO_PIN,WAKEUP_ENABLE,10,1)
+REG32(RTC_PAD_CFG,0x7c)
+REG32(RTC_DIG_PAD_HOLD,0x74)
+REG32(RTC_EXT_WAKEUP0,0xbc)
+
 
 #define ESP32_STRAP_MODE_FLASH_BOOT 0x12
 #define ESP32_STRAP_MODE_UART_BOOT  0x0f
@@ -61,6 +85,7 @@ typedef struct Esp32GpioState {
 
     MemoryRegion iomem;
     MemoryRegion iomuxmem;
+    MemoryRegion iortcmem;
     qemu_irq irq;
     uint32_t gpio_out;
     uint32_t gpio_out1;
@@ -80,9 +105,19 @@ typedef struct Esp32GpioState {
     uint32_t gpio_out_sel[40];
     qemu_irq gpios[40];
     uint32_t iomux_regs[41];
+   // uint32_t rtcio_regs[64];
+    uint32_t rtc_gpio_out;
+    uint32_t rtc_gpio_in;
+    uint32_t rtc_gpio_status;
+    uint32_t rtc_gpio_enable;
+    uint32_t rtc_gpio_pin[18];
+    uint32_t rtc_pad_cfg[16];
+    uint32_t rtc_dig_pad_hold;
+    uint32_t rtc_ext_wakeup0;
     QemuConsole *con;
     uint32_t *data;
     uint32_t redraw;
+    qemu_irq rtc_reset;
 } Esp32GpioState;
 
 typedef struct Esp32GpioClass {

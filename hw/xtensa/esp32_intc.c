@@ -25,7 +25,7 @@
 static void esp32_intmatrix_irq_handler(void *opaque, int n, int level)
 {
     Esp32IntMatrixState *s = ESP32_INTMATRIX(opaque);
-    
+//    printf("esp32_intmatrix_irq_handler %x %x\n",n,level);
     s->irq_raw[n] = level;
     for (int i = 0; i < ESP32_CPU_COUNT; ++i) {
         if (s->outputs[i] == NULL) {
@@ -85,6 +85,7 @@ static const MemoryRegionOps esp_intmatrix_ops = {
 };
 
 static void esp32_intmatrix_reset_hold(Object *dev, ResetType type) {
+//    printf("esp32_intmatrix_reset_hold\n");
     Esp32IntMatrixState *s = ESP32_INTMATRIX(dev);
     memset(s->irq_raw, 0, sizeof(s->irq_raw));
     memset(s->irq_map, INTMATRIX_UNINT_VALUE, sizeof(s->irq_map));

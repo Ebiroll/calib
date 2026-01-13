@@ -413,6 +413,16 @@ static void remove_cpu_watchpoints(XtensaCPU* xcs)
     }
 }
 
+static void esp32_full_reset(void *opaque, int n, int level)
+{
+    Esp32SocState *s = ESP32_SOC(opaque);
+    if (level) {
+        for (int i = 0; i < ESP32_CPU_COUNT; ++i) {
+            s->rtc_cntl.reset_cause[i] = ESP32_SW_CPU_RESET;
+        }
+        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+    }
+}
 static void esp32_dig_reset(void *opaque, int n, int level)
 {
     Esp32SocState *s = ESP32_SOC(opaque);
@@ -440,6 +450,7 @@ static void esp32_cpu_reset(void* opaque, int n, int level)
 static void esp32_timg_cpu_reset(void* opaque, int n, int level)
 {
     Esp32SocState *s = ESP32_SOC(opaque);
+//    printf("esp32_timg_cpu_reset\n");
     if (level) {
         s->requested_reset = (n == 0) ? ESP32_SOC_RESET_PROCPU : ESP32_SOC_RESET_APPCPU;
         /* Use different cause for APP CPU so that its reset doesn't cause QEMU to exit,
@@ -448,6 +459,40 @@ static void esp32_timg_cpu_reset(void* opaque, int n, int level)
         ShutdownCause cause = (n == 0) ? SHUTDOWN_CAUSE_GUEST_RESET : SHUTDOWN_CAUSE_SUBSYSTEM_RESET;
         s->rtc_cntl.reset_cause[n] = ESP32_TGWDT_CPU_RESET;
         qemu_system_reset_request(cause);
+    }
+}
+
+static void esp32_rtc_reset(void* opaque, int n, int level)
+{
+ //   printf("esp32_rtc_reset %d\n",level);
+    Esp32SocState *s = ESP32_SOC(opaque);
+
+    if(level && !FIELD_EX32(s->rtc_cntl.sdio_conf,RTC_CNTL_SDIO_CONF,VREG_PD_EN) /*s->rtc_cntl.mem_conf==0*/) {
+        s->rtc_cntl.int_raw=1;
+        
+   //     s->requested_reset = ESP32_SOC_RESET_RTC;
+   //     qemu_system_reset_request(SHUTDOWN_CAUSE_NONE);
+        //s->gpio.rtcio_regs[0x20]=0;
+
+        return;
+    }
+
+    if (level) {
+    //    esp32_dport_clear_ill_trap_state(&s->dport);
+      //  ShutdownCause cause = SHUTDOWN_CAUSE_SUBSYSTEM_RESET;
+        s->requested_reset = ESP32_SOC_RESET_ALL; // ESP32_SOC_RESET_RTC | ESP32_SOC_RESET_APPCPU | ESP32_SOC_RESET_PROCPU;
+        for (int i = 0; i < ESP32_CPU_COUNT; ++i) {
+            s->rtc_cntl.reset_cause[i] = ESP32_DEEPSLEEP_RESET;
+      //      s->rtc_cntl.stat_vector_sel[i] = true;
+        }
+    //    s->timg[0].wdt_en_at_reset=false;
+//        s->rtc_cntl.reset_cause[0] = ESP32_DEEPSLEEP_RESET;
+      //  for (int i = 0; i < ESP32_CPU_COUNT; ++i) {
+      //      s->rtc_cntl.reset_cause[i] = ESP32_DEEPSLEEP_RESET;
+      //  }
+      //  s->rtc_cntl.reset_cause[0] = ESP32_EXT_CPU_RESET;//ESP32_DEEPSLEEP_RESET;
+        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+        s->rtc_cntl.sdio_conf=FIELD_DP32(s->rtc_cntl.sdio_conf,RTC_CNTL_SDIO_CONF,VREG_PD_EN,0);
     }
 }
 
@@ -468,7 +513,9 @@ static void esp32_soc_reset(DeviceState *dev)
 { 
     Esp32SocState *s = ESP32_SOC(dev);
 
+    qemu_system_wakeup_request(QEMU_WAKEUP_REASON_OTHER, NULL);
     uint32_t strap_mode = s->gpio.strap_mode;
+ //   printf("soc_reset %d %d\n",s->requested_reset,s->rtc_cntl.reset_cause[0]);
 
     bool flash_boot_mode = ((strap_mode & 0x10) || (strap_mode & 0x1f) == 0x0c);
     qemu_set_irq(qdev_get_gpio_in_named(DEVICE(&s->flash_enc), ESP32_FLASH_ENCRYPTION_DL_MODE_GPIO, 0), !flash_boot_mode);
@@ -709,6 +756,9 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
     qdev_connect_gpio_out_named(DEVICE(&s->rtc_cntl), ESP32_DPORT_CLK_UPDATE_GPIO, 0,
                                 qdev_get_gpio_in_named(dev, ESP32_RTC_CLK_UPDATE_GPIO, 0));
 
+    qdev_connect_gpio_out_named(DEVICE(&s->gpio), ESP32_RTCIO_RESET_GPIO, 0,
+                                    qdev_get_gpio_in_named(dev, ESP32_RTCIO_RESET_GPIO, 0));
+
     for (int i = 0; i < ESP32_CPU_COUNT; ++i) {
         char name[16];
         snprintf(name, sizeof(name), "cpu%d", i);
@@ -798,6 +848,8 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
     qdev_realize(DEVICE(&s->gpio), &s->periph_bus, &error_fatal);
     esp32_soc_add_periph_device(sys_mem, &s->gpio, DR_REG_GPIO_BASE);
     esp32_soc_add_periph_device_n(sys_mem, &s->gpio, DR_REG_IO_MUX_BASE,1);
+    esp32_soc_add_periph_device_n(sys_mem, &s->gpio, DR_REG_RTCIO_BASE,2);
+
 
     sysbus_connect_irq(SYS_BUS_DEVICE(&s->gpio),0,qdev_get_gpio_in(intmatrix_dev, ETS_GPIO_INTR_SOURCE));
 
@@ -846,7 +898,7 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
         qdev_connect_gpio_out_named(DEVICE(&s->timg[i]), ESP32_TIMG_WDT_SYS_RESET_GPIO, 0,
                                     qdev_get_gpio_in_named(dev, ESP32_TIMG_WDT_SYS_RESET_GPIO, i));
     }
-    s->timg[0].wdt_en_at_reset = true;
+ //   s->timg[0].wdt_en_at_reset = true;
     const hwaddr spi_base[] = {
             DR_REG_SPI0_BASE, DR_REG_SPI1_BASE, DR_REG_SPI2_BASE, DR_REG_SPI3_BASE
     };
@@ -924,7 +976,7 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
     sysbus_connect_irq(SYS_BUS_DEVICE(&s->sdmmc), 0,
                        qdev_get_gpio_in(intmatrix_dev, ETS_SDIO_HOST_INTR_SOURCE));
 
-    esp32_soc_add_unimp_device(sys_mem, "esp32.rtcio", DR_REG_RTCIO_BASE, 0x400,0);
+ //   esp32_soc_add_unimp_device(sys_mem, "esp32.rtcio", DR_REG_RTCIO_BASE, 0x400,0);
     esp32_soc_add_unimp_device(sys_mem, "esp32.wdg", DR_REG_WDG_BASE, 0x1000,0);
     esp32_soc_add_unimp_device(sys_mem, "esp32.hinf", DR_REG_HINF_BASE, 0x1000,0);
     esp32_soc_add_unimp_device(sys_mem, "esp32.slc", DR_REG_SLC_BASE, 0x1000,0);
@@ -974,6 +1026,11 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
     qdev_connect_gpio_out_named(disp, "buttons", 1, in35);
     qdev_connect_gpio_out_named(disp1, "buttons", 0, in0);
     qdev_connect_gpio_out_named(disp1, "buttons", 1, in35);
+
+    qdev_connect_gpio_out_named(disp, "reset", 0,
+                                    qdev_get_gpio_in_named(dev, "full_reset", 0));
+
+
 
     /* Emulation of a fake register used to mark that the chip is run via QEMU */
     MemoryRegion *apbctrl_mem = g_new(MemoryRegion, 1);
@@ -1114,8 +1171,11 @@ static void esp32_soc_init(Object *obj)
     qdev_init_gpio_in_named(DEVICE(s), esp32_cpu_reset, ESP32_RTC_CPU_RESET_GPIO, ESP32_CPU_COUNT);
     qdev_init_gpio_in_named(DEVICE(s), esp32_cpu_stall, ESP32_RTC_CPU_STALL_GPIO, ESP32_CPU_COUNT);
     qdev_init_gpio_in_named(DEVICE(s), esp32_clk_update, ESP32_RTC_CLK_UPDATE_GPIO, 1);
+    qdev_init_gpio_in_named(DEVICE(s), esp32_rtc_reset, ESP32_RTCIO_RESET_GPIO, 1);
     qdev_init_gpio_in_named(DEVICE(s), esp32_timg_cpu_reset, ESP32_TIMG_WDT_CPU_RESET_GPIO, 2);
     qdev_init_gpio_in_named(DEVICE(s), esp32_timg_sys_reset, ESP32_TIMG_WDT_SYS_RESET_GPIO, 2);
+    qdev_init_gpio_in_named(DEVICE(s), esp32_full_reset, "full_reset", 1);
+
 }
 
 static Property esp32_soc_properties[] = {

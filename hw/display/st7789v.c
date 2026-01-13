@@ -61,6 +61,7 @@ struct  St7789vState {
     ConsoleState *con;
     bool iss3;
     qemu_irq button[2];
+    qemu_irq reset;
 };
 
 #define TYPE_ST7789V "st7789v"
@@ -338,7 +339,7 @@ static void keyboard_event(DeviceState *dev, QemuConsole *src,
                 qemu_set_irq(s->button[1], up);
             }
             if (qcode == Q_KEY_CODE_R) {
-                qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+                qemu_set_irq(s->reset, up);
             }
             int touch_codes[] = {Q_KEY_CODE_7, Q_KEY_CODE_8, Q_KEY_CODE_9,
                                  Q_KEY_CODE_0};
@@ -383,7 +384,7 @@ static void keyboard_event(DeviceState *dev, QemuConsole *src,
                     }
                     if (xpos > 157 && xpos < 2835 && ypos > 25580 &&
                         ypos < 27294 && up == 0)
-                        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+                        qemu_set_irq(s->reset, 1);
                 } else {
                     if (xpos > 24996 && xpos < 27962 && ypos > 28481 &&
                         ypos < 30347) {
@@ -395,7 +396,7 @@ static void keyboard_event(DeviceState *dev, QemuConsole *src,
                     }
                     if (xpos > 30876 && xpos < 32530 && ypos > 23503 &&
                         ypos < 24713 && up == 0)
-                        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+                        qemu_set_irq(s->reset, 1);
                 }
                 int xs[] = {0,    0, 1417,  1417,  1417,
                             1417, 0, 30010, 30010, 30010};
@@ -421,7 +422,7 @@ static void keyboard_event(DeviceState *dev, QemuConsole *src,
 
                     if (xpos > 25382 && xpos < 30561 && ypos > 30063 &&
                         ypos < 31382 && up == 0)
-                        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+                        qemu_set_irq(s->reset, 1);
                 } else {
                     if (xpos > 28308 && xpos < 30451 && ypos > 5199 &&
                         ypos < 8428) {
@@ -433,7 +434,7 @@ static void keyboard_event(DeviceState *dev, QemuConsole *src,
                     }
                     if (xpos > 23607 && xpos < 24540 && ypos > 551 && ypos < 1732 &&
                         up == 0)
-                        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+                        qemu_set_irq(s->reset, 1);
                 }
                 int xs[] = {0,     0, 12166, 13618, 15277,
                             16798, 0, 18388, 12166, 13791};
@@ -474,6 +475,7 @@ static void st7789v_realize(SSIPeripheral *d, Error **errp) {
     qdev_init_gpio_in_named(dev, st7789v_cd, "cmd",1);
     qdev_init_gpio_in_named(dev, st7789v_backlight, "backlight", 1);
     qdev_init_gpio_out_named(dev,s->button,"buttons",2);
+    qdev_init_gpio_out_named(dev,&s->reset,"reset",1);
 
     if (console_state.con == 0) {
         ConsoleState *c=&console_state;
@@ -494,7 +496,6 @@ static void st7789v_reset(DeviceState *dev) {
     if (console_state.con != 0) {
         int64_t now=qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
         console_state.lasttime=now;
-       // console_state.lastlevel=0;
     }
 }
 

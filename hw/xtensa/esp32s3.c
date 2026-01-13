@@ -1027,6 +1027,9 @@ static void esp32s3_machine_init(MachineState *machine)
     qemu_irq in14=qdev_get_gpio_in_named(DEVICE(&ss->gpio), ESP32_GPIOS_IN, 14);
     qdev_connect_gpio_out_named(disp, "buttons", 0, in0);
     qdev_connect_gpio_out_named(disp, "buttons", 1, in14);
+    qdev_connect_gpio_out_named(disp, "reset", 0,
+                                    qdev_get_gpio_in_named(DEVICE(ss), ESP32S3_RTC_DIG_RESET_GPIO, 0));
+
 
 
     /* SHA realization */

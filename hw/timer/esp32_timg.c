@@ -268,6 +268,7 @@ static const MemoryRegionOps esp32_timg_ops = {
 static void esp32_timg_timer_reset(Esp32TimgTimerState* ts)
 {
     timer_del(&ts->alarm_timer);
+    
     ts->config_reg = R_TIMG_T0CONFIG_INCREASE_MASK
         | R_TIMG_T0CONFIG_AUTORELOAD_MASK
         | (1 << R_TIMG_T0CONFIG_DIVIDER_SHIFT);
@@ -280,7 +281,14 @@ static void esp32_timg_timer_reset(Esp32TimgTimerState* ts)
 
 static void esp32_timg_wdt_reset(Esp32TimgWdtState* ws)
 {
+
+//    printf("esp32_timg_wdt_reset\n");
     timer_del(&ws->stage_timer);
+  //  Esp32TimgState *s = ws->parent;
+  //  qemu_irq_lower(s->wdt_sys_reset_req);
+  //  qemu_irq_lower(s->wdt_cpu_reset_req);
+
+  //  qemu_irq_lower(get_level_irq(s, TIMG_WDT_INT));
 
     ws->config0_reg = 0x0004c000;
     ws->config1_reg = 0x00010000;
@@ -288,7 +296,14 @@ static void esp32_timg_wdt_reset(Esp32TimgWdtState* ws)
     ws->timeout[1] = 0x07ffffff;
     ws->timeout[2] = 0x000fffff;
     ws->timeout[3] = 0x000fffff;
+    ws->level_int_en = 0;
+    ws->edge_int_en = 0;
+    ws->en = 0;
     ws->protect_reg = ESP32_TIMG_WDT_PROTECT_WORD;
+    ws->count_base=0;
+    ws->ns_base=0;
+    ws->prescale=0;
+    ws->cur_stage=0;
 
     if (ws->parent->wdt_en_at_reset) {
         /* On reset, stage0 is configured as system reset, however this is done by
@@ -347,7 +362,7 @@ static void esp32_timg_timer_cb(void *opaque)
     Esp32TimgState *s = ts->parent;
     uint64_t ns_now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
-    TIMG_DEBUG_LOG("%s: TG%d ns=0x%llx\n", __func__, s->id, ns_now);
+    TIMG_DEBUG_LOG("%s: TG%d ns=0x%lx\n", __func__, s->id, ns_now);
     uint32_t int_mask = 1 << (ts->int_type);
 
     if (ts->level_int_en) {
@@ -444,7 +459,7 @@ static void esp32_timg_timer_update_config(Esp32TimgTimerState *ts)
     ts->level_int_en = FIELD_EX32(ts->config_reg, TIMG_T0CONFIG, LEVEL_INT);
     ts->alarm = FIELD_EX32(ts->config_reg, TIMG_T0CONFIG, ALARM);
 
-    TIMG_DEBUG_LOG("%s: TG%d base=0x%llx ns=0x%llx en=%d inc=%d autoreload=%d div=%d li=%d ei=%d alarm=%d\n", __func__, ts->parent->id,
+    TIMG_DEBUG_LOG("%s: TG%d base=0x%lx ns=0x%lx en=%d inc=%d autoreload=%d div=%d li=%d ei=%d alarm=%d\n", __func__, ts->parent->id,
              ts->count_base, ts->ns_base, ts->en, ts->inc, ts->autoreload, ts->divider,
              ts->level_int_en, ts->edge_int_en, ts->alarm);
     esp32_timg_timer_update_alarm(ts, ns_now);
@@ -457,7 +472,7 @@ static void esp32_timg_timer_reload(Esp32TimgTimerState *ts, uint64_t ns_now)
     ts->ns_base = ns_now;
     ts->count_base = ts->load_val;
 
-    TIMG_DEBUG_LOG("%s: TG%d base=0x%llx ns=0x%llx\n", __func__, ts->parent->id,
+    TIMG_DEBUG_LOG("%s: TG%d base=0x%lx ns=0x%lx\n", __func__, ts->parent->id,
              ts->count_base, ts->ns_base);
 
     esp32_timg_timer_update_alarm(ts, ns_now);
@@ -561,7 +576,7 @@ static void esp32_timg_wdt_arm(Esp32TimgWdtState *ws, uint64_t ns_now)
     uint32_t cur_count = esp32_timg_wdt_get_count(ws, ns_now);
     uint32_t count_to_timeout = stage_timeout - cur_count;
     uint64_t ns_to_timeout = muldiv64(count_to_timeout, 1000 * ws->prescale, ws->parent->apb_freq_hz / 1000000);
-    TIMG_DEBUG_LOG("%s: TG%d ns=0x%08llx stage %d count=0x%08x count_to_timeout=0x%08x ns_to_timeout=0x%08llx\n",
+    TIMG_DEBUG_LOG("%s: TG%d ns=0x%08lx stage %d count=0x%08x count_to_timeout=0x%08x ns_to_timeout=0x%08lx\n",
                    __func__, ws->parent->id, ns_now, ws->cur_stage, cur_count, count_to_timeout, ns_to_timeout);
     timer_mod_anticipate_ns(&ws->stage_timer, ns_now + ns_to_timeout);
 }
@@ -571,7 +586,9 @@ static void esp32_timg_wdt_cb(void *opaque)
     Esp32TimgWdtState *ws = (Esp32TimgWdtState*) opaque;
     Esp32TimgState *s = ws->parent;
     Esp32TimgWdtStageMode mode = ws->mode[ws->cur_stage];
+
     TIMG_DEBUG_LOG("%s: TG%d stage %d timeout mode %d\n", __func__, s->id, ws->cur_stage, mode);
+    
     if (mode == WDT_MODE_INT) {
         uint32_t mask = 1 << TIMG_WDT_INT;
         if (ws->level_int_en) {
@@ -586,8 +603,10 @@ static void esp32_timg_wdt_cb(void *opaque)
             }
         }
     } else if (mode == WDT_MODE_CPURESET) {
+       // printf("CPU Reset\n");
         qemu_irq_pulse(s->wdt_cpu_reset_req);
     } else if (mode == WDT_MODE_SYSRESET) {
+       // printf("System Reset\n");
         qemu_irq_pulse(s->wdt_sys_reset_req);
     }
 

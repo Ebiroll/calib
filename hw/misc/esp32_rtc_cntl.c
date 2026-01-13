@@ -20,9 +20,25 @@
 #include "hw/qdev-properties.h"
 #include "hw/misc/esp32_reg.h"
 #include "hw/misc/esp32_rtc_cntl.h"
+#include "sysemu/runstate.h"
 
 static void esp32_rtc_update_cpu_stall(Esp32RtcCntlState* s);
 static void esp32_rtc_update_clk(Esp32RtcCntlState* s);
+
+static void sleep_timer_cb(void *opaque)
+{
+    Esp32RtcCntlState *s = (Esp32RtcCntlState*) opaque;
+//    printf("sleep_timer_cb\n");
+    s->wakeup_state_reg = FIELD_DP32(s->wakeup_state_reg, RTC_CNTL_WAKEUP_STATE, WAKEUP_CAUSE, 4); // ESP_SLEEP_WAKEUP_TIMER
+    qemu_system_wakeup_request(QEMU_WAKEUP_REASON_OTHER, NULL);
+    if(FIELD_EX32(s->sdio_conf,RTC_CNTL_SDIO_CONF,VREG_PD_EN)) {
+        for (int i = 0; i < ESP32_CPU_COUNT; ++i) {
+            s->reset_cause[i] = ESP32_DEEPSLEEP_RESET;
+        }
+        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+        s->sdio_conf=FIELD_DP32(s->sdio_conf,RTC_CNTL_SDIO_CONF,VREG_PD_EN,0);
+    }
+}
 
 static uint64_t esp32_rtc_cntl_read(void *opaque, hwaddr addr, unsigned int size)
 {
@@ -66,13 +82,48 @@ static uint64_t esp32_rtc_cntl_read(void *opaque, hwaddr addr, unsigned int size
         r = s->sw_cpu_stall_reg;
         break;
 
+    case A_RTC_CNTL_STATE0:
+        r = s->state0;
+        break;
+
+    case A_RTC_CNTL_SLEEP_TIMER0:
+        r = s->sleep_timer0_reg;
+        break;
+
+    case A_RTC_CNTL_SLEEP_TIMER1:
+        r = s->sleep_timer1_reg;
+        break;
+
     case A_RTC_CNTL_STORE4:
     case A_RTC_CNTL_STORE5:
     case A_RTC_CNTL_STORE6:
     case A_RTC_CNTL_STORE7:
         r = s->scratch_reg[(addr - A_RTC_CNTL_STORE4) / 4 + 4];
         break;
+    case A_RTC_CNTL_WAKEUP_STATE:
+        r = s->wakeup_state_reg;//FIELD_DP32(r, RTC_CNTL_WAKEUP_STATE, WAKEUP_CAUSE, 3); // ESP_SLEEP_WAKEUP_EXT1
+        break;
+    case A_RTC_MEM_CONF:
+        r = s->mem_conf;
+        if (FIELD_EX32(r,RTC_MEM_CONF,CRC_START))
+            r = FIELD_DP32(r, RTC_MEM_CONF, CRC_FINISH, 1);
+        else
+            r = FIELD_DP32(r, RTC_MEM_CONF, CRC_FINISH, 0);
+        break;
+    case A_RTC_CNTL_INT_RAW:
+        r = s->int_raw;
+        break;
+    case A_RTC_CNTL_INT_ENA:
+        r = s->int_en;
+        break;
+    case A_RTC_CNTL_INT_ST:
+        r = s->int_raw & s->int_en;
+        break;
+    case A_RTC_CNTL_SDIO_CONF:
+        r = s->sdio_conf;
+        break;
     }
+//    printf("RTC_CNTL Read %lx %lx\n",addr,r);
     return r;
 }
 
@@ -80,6 +131,7 @@ static void esp32_rtc_cntl_write(void *opaque, hwaddr addr, uint64_t value,
                                  unsigned int size)
 {
     Esp32RtcCntlState *s = ESP32_RTC_CNTL(opaque);
+//    printf("RTC_CNTL Write %lx %lx\n",addr,value);
     switch (addr) {
     case A_RTC_CNTL_OPTIONS0:
         if (value & R_RTC_CNTL_OPTIONS0_SW_SYS_RESET_MASK) {
@@ -117,11 +169,37 @@ static void esp32_rtc_cntl_write(void *opaque, hwaddr addr, uint64_t value,
                                            APPCPU_STAT_VECTOR_SEL);
         break;
 
+    case A_RTC_CNTL_STATE0:
+        s->state0 = value;
+        if(FIELD_EX32(value, RTC_CNTL_STATE0,SLEEP_EN)) {
+            s->int_raw = 1;
+            s->wakeup_state_reg = FIELD_DP32(s->wakeup_state_reg, RTC_CNTL_WAKEUP_STATE, WAKEUP_CAUSE, 3); // ESP_SLEEP_WAKEUP_EXT1
+            uint64_t sleep_time=s->sleep_timer0_reg | ((uint64_t)FIELD_EX32(s->sleep_timer1_reg,RTC_CNTL_SLEEP_TIMER1,VAL_HI)<<32);
+            int timer_en=FIELD_EX32(s->wakeup_state_reg, RTC_CNTL_WAKEUP_STATE, WAKEUP_ENA_RTC_TIMER);
+            uint64_t sleep_ns=muldiv64(
+                sleep_time - s->time_reg, NANOSECONDS_PER_SECOND,
+                s->rtc_slowclk_freq);
+ //           printf("Sleep %ld, %ld, %d, %ld\n",s->time_reg, sleep_time, timer_en, sleep_ns);
+            if(timer_en)
+                timer_mod(&s->sleep_timer, qemu_clock_get_ns(QEMU_CLOCK_REALTIME)+sleep_ns);
+         //   s->wakeup_state_reg=FIELD_DP32(s->wakeup_state_reg, RTC_CNTL_WAKEUP_STATE, WAKEUP_ENA_RTC_TIMER,0);
+            qemu_system_suspend_request();
+        }
+        break;
+
     case A_RTC_CNTL_STORE0:
     case A_RTC_CNTL_STORE1:
     case A_RTC_CNTL_STORE2:
     case A_RTC_CNTL_STORE3:
         s->scratch_reg[(addr - A_RTC_CNTL_STORE0) / 4] = value;
+        break;
+
+    case A_RTC_CNTL_SLEEP_TIMER0:
+        s->sleep_timer0_reg = value;
+        break;
+
+    case A_RTC_CNTL_SLEEP_TIMER1:
+        s->sleep_timer1_reg = value;
         break;
 
     case A_RTC_CNTL_CLK_CONF:
@@ -141,6 +219,24 @@ static void esp32_rtc_cntl_write(void *opaque, hwaddr addr, uint64_t value,
     case A_RTC_CNTL_STORE6:
     case A_RTC_CNTL_STORE7:
         s->scratch_reg[(addr - A_RTC_CNTL_STORE4) / 4 + 4] = value;
+        break;
+    case A_RTC_CNTL_WAKEUP_STATE:
+        s->wakeup_state_reg = value;
+        break;
+    case A_RTC_MEM_CONF:
+        s->mem_conf = value;
+        break;
+    case A_RTC_CNTL_INT_RAW:
+        s->int_raw = value;
+        break;
+    case A_RTC_CNTL_INT_ENA:
+        s->int_en = value;
+        break;
+    case A_RTC_CNTL_INT_CLR:
+        s->int_raw &= ~value;
+        break;
+    case A_RTC_CNTL_SDIO_CONF:
+        s->sdio_conf = value;
         break;
     }
 }
@@ -180,7 +276,7 @@ static const MemoryRegionOps esp32_rtc_cntl_ops = {
 static void esp32_rtc_cntl_reset_hold(Object *obj, ResetType type)
 {
     Esp32RtcCntlState *s = ESP32_RTC_CNTL(obj);
-
+    s->state0=0;
     s->time_base_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 }
 
@@ -212,6 +308,7 @@ static void esp32_rtc_cntl_init(Object *obj)
     s->soc_clk = ESP32_SOC_CLK_XTAL;
     s->xtal_apb_freq = 40000000;
     s->pll_apb_freq = 80000000;
+    timer_init_ns(&s->sleep_timer, QEMU_CLOCK_REALTIME, sleep_timer_cb, s);
     esp32_rtc_update_clk(s);
 }
 
