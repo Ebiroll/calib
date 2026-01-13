@@ -186,15 +186,17 @@ static void btdm_em_write(void *opaque, hwaddr addr, uint64_t val, unsigned size
         /* Skip SENTINEL and em_ptr spam at lower debug levels */
         if (btdm_em_debug_level < 3) {
             if (v == BLE_CS_SENTINEL) return;
-            /* Also skip repeated em_ptr writes to list management fields */
+            /* Also skip repeated em_ptr writes to queue header region */
             if ((v >= 0x3ffb0000) && (v < 0x3ffb8000) && 
-                (addr < 0x28d0)) return;  /* Skip list head updates */
+                (addr < BLE_CS_FIRST_ENTRY)) return;
         }
         
-        /* Get field name from offset */
-        const char *field_name = ble_cs_field_name(addr);
+        /* Get field name and CS index from offset */
+        int cs_idx = -1;
+        int is_osi = 0;
+        const char *field_name = ble_cs_field_name(addr, &cs_idx, &is_osi);
         
-        /* Build annotation for value */
+        /* Build annotation for value - distinguish code regions */
         const char *annotation = "";
         if (size == 4) {
             if (v == BLE_CS_SENTINEL) {
@@ -207,8 +209,12 @@ static void btdm_em_write(void *opaque, hwaddr addr, uint64_t val, unsigned size
                 annotation = " ; NVDS_MAGIC";
             } else if (v == 0xffffffff) {
                 annotation = " ; INVALID";
-            } else if ((v >= 0x40000000) && (v < 0x50000000)) {
-                annotation = " ; code_ptr";
+            } else if ((v >= 0x40000000) && (v < 0x40070000)) {
+                annotation = " ; ROM_fn";     /* ROM code 0x40000000-0x4006FFFF */
+            } else if ((v >= 0x40070000) && (v < 0x400C0000)) {
+                annotation = " ; IRAM_fn";    /* IRAM code 0x40070000-0x400BFFFF */
+            } else if ((v >= 0x400C0000) && (v < 0x40400000)) {
+                annotation = " ; FLASH_fn";   /* Flash-mapped code 0x400C0000+ */
             } else if ((v >= 0x3ffb0000) && (v < 0x3ffb8000)) {
                 annotation = " ; em_ptr";
             } else if ((v >= 0x3ff00000) && (v < 0x40000000)) {
@@ -216,17 +222,28 @@ static void btdm_em_write(void *opaque, hwaddr addr, uint64_t val, unsigned size
             }
         }
         
-        /* Compute CS entry index */
-        uint32_t cs_idx = (addr - EM_BLE_CS_OFFSET) / BLE_CS_STRIDE;
-        
-        if (field_name) {
+        if (is_osi) {
+            /* OSI function table entry */
+            if (field_name) {
+                fprintf(stderr, "EM_WR [BLE_OSI.%s] 0x%04" HWADDR_PRIx " (%d) <- 0x%0*" PRIx64 "%s\n",
+                        field_name, addr, size, size*2, val, annotation);
+            } else {
+                fprintf(stderr, "EM_WR [BLE_OSI[%d]] 0x%04" HWADDR_PRIx " (%d) <- 0x%0*" PRIx64 "%s\n",
+                        cs_idx, addr, size, size*2, val, annotation);
+            }
+        } else if (cs_idx < 0 && field_name) {
+            /* Queue header region */
+            fprintf(stderr, "EM_WR [BLE_Q.%s] 0x%04" HWADDR_PRIx " (%d) <- 0x%0*" PRIx64 "%s\n",
+                    field_name, addr, size, size*2, val, annotation);
+        } else if (field_name) {
+            /* CS entry with known field */
             fprintf(stderr, "EM_WR [BLE_CS%d.%s] 0x%04" HWADDR_PRIx " (%d) <- 0x%0*" PRIx64 "%s\n",
                     cs_idx, field_name, addr, size, size*2, val, annotation);
         } else {
-            /* Unknown field - show raw offset */
-            uint32_t field_off = (addr - EM_BLE_CS_OFFSET) % BLE_CS_STRIDE;
-            fprintf(stderr, "EM_WR [BLE_CS%d+0x%02x] 0x%04" HWADDR_PRIx " (%d) <- 0x%0*" PRIx64 "%s\n",
-                    cs_idx, field_off, addr, size, size*2, val, annotation);
+            /* Unknown field - show raw offset from region */
+            uint32_t raw_off = addr - EM_BLE_CS_OFFSET;
+            fprintf(stderr, "EM_WR [BLE+0x%03x] 0x%04" HWADDR_PRIx " (%d) <- 0x%0*" PRIx64 "%s\n",
+                    raw_off, addr, size, size*2, val, annotation);
         }
     }
     else if (btdm_em_debug_level >= 2) {

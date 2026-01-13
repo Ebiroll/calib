@@ -248,13 +248,67 @@ typedef struct __attribute__((packed)) {
 #define RWIP_ACT_CONN       0x03    /* Connection */
 
 /*
- * BLE CS field name lookup
- * Based on RivieraWaves ble_util_buf / sch_arb / llc structures
- * CS entries are at 0x2800+ with 0x64 (100 byte) stride for ADV/SCAN
- * Connection CS may be larger (0x80-0xA0 bytes)
+ * RivieraWaves co_list header structure (from reversed code)
  */
-#define BLE_CS_STRIDE       0x64    /* 100 bytes per basic CS entry */
-#define BLE_CS_CONN_STRIDE  0x80    /* 128 bytes for connection CS */
+typedef struct __attribute__((packed)) {
+    uint32_t head;      /* 0x00: First element pointer */
+    uint32_t tail;      /* 0x04: Last element pointer */
+    uint32_t count;     /* 0x08: Current element count */
+    uint32_t max_count; /* 0x0C: Maximum element count (watermark) */
+} co_list_t;
+
+/*
+ * ESP32 BLE OSI (OS Interface) function table
+ * Located at EM offset 0x2960 - provides FreeRTOS abstraction to BLE ROM
+ * These are wrapper functions for the BLE stack to call FreeRTOS APIs
+ */
+typedef struct __attribute__((packed)) {
+    uint32_t version;               /* 0x00: OSI version/magic */
+    uint32_t set_isr;               /* 0x04: Register ISR handler */
+    uint32_t ints_on;               /* 0x08: Enable interrupts */
+    uint32_t ints_off;              /* 0x0C: Disable interrupts */
+    uint32_t task_create;           /* 0x10: Create task */
+    uint32_t task_delete;           /* 0x14: Delete task */
+    uint32_t task_yield;            /* 0x18: Yield to scheduler */
+    uint32_t task_yield_from_isr;   /* 0x1C: Yield from ISR */
+    uint32_t semphr_create;         /* 0x20: Create semaphore */
+    uint32_t semphr_delete;         /* 0x24: Delete semaphore */
+    uint32_t semphr_take;           /* 0x28: Take semaphore */
+    uint32_t semphr_give;           /* 0x2C: Give semaphore */
+    uint32_t semphr_take_from_isr;  /* 0x30: Take from ISR */
+    uint32_t semphr_give_from_isr;  /* 0x34: Give from ISR */
+    uint32_t mutex_create;          /* 0x38: Create mutex */
+    uint32_t mutex_delete;          /* 0x3C: Delete mutex */
+    uint32_t mutex_lock;            /* 0x40: Lock mutex */
+    uint32_t mutex_unlock;          /* 0x44: Unlock mutex */
+    uint32_t queue_create;          /* 0x48: Create queue */
+    uint32_t queue_delete;          /* 0x4C: Delete queue */
+    uint32_t queue_send;            /* 0x50: Send to queue */
+    uint32_t queue_send_from_isr;   /* 0x54: Send from ISR */
+    uint32_t queue_recv;            /* 0x58: Receive from queue */
+    uint32_t queue_recv_from_isr;   /* 0x5C: Receive from ISR */
+    uint32_t timer_create;          /* 0x60: Create timer */
+    uint32_t timer_delete;          /* 0x64: Delete timer */
+    uint32_t timer_start;           /* 0x68: Start timer */
+    uint32_t timer_stop;            /* 0x6C: Stop timer */
+    /* ... more functions ... */
+} ble_osi_funcs_t;
+
+/*
+ * BLE CS layout (corrected based on log analysis):
+ * - 0x2800-0x28CB: Queue headers (multiple co_list_t structures)
+ * - 0x28CC-0x295F: CS entries (variable structure, ~0x30 bytes each)
+ * - 0x2960-0x2A5F: OSI function table (FreeRTOS wrappers for BLE ROM)
+ * - 0x2A60+: More CS entries or data structures
+ */
+#define BLE_CS_QUEUE_BASE   0x2800  /* Queue headers start */
+#define BLE_CS_FIRST_ENTRY  0x28CC  /* First actual CS entry (EM offset) */
+#define BLE_CS_STRIDE       0x30    /* 48 bytes per CS entry */
+#define BLE_CS_HDR_SIZE     0xCC    /* Queue headers before first CS */
+
+/* OSI function table base (EM offset) - FreeRTOS wrappers */
+#define BLE_OSI_FUNCS_BASE  0x2960  /* Start of OSI function pointer table */
+#define BLE_OSI_FUNCS_END   0x2A60  /* End of OSI function pointer table (64 functions x 4 bytes) */
 
 /* 
  * Known EM regions (offsets from 0x3FFB0000)
@@ -296,51 +350,167 @@ typedef struct __attribute__((packed)) {
 
 /*
  * BLE CS field name lookup function
- * Based on RivieraWaves ble_util_buf / sch_arb / llc structures
+ * Handles: queue headers (0x2800-0x28CB), CS entries (0x28CC-0x295F), 
+ * OSI function table (0x2960-0x2A5F), and post-OSI data (0x2A60+)
  */
-static inline const char *ble_cs_field_name(uint32_t addr)
+static inline const char *ble_cs_field_name(uint32_t addr, int *out_cs_idx, int *out_is_osi)
 {
-    /* Offset within the BLE_CS region (0x2800-0x3000) */
-    uint32_t cs_off = addr - EM_BLE_CS_OFFSET;  /* 0x2800 base */
+    uint32_t off = addr;  /* Already EM offset */
     
-    /* Compute field offset within a CS entry (using 0x64 stride) */
-    uint32_t field_off = cs_off % BLE_CS_STRIDE;
+    *out_cs_idx = -1;
+    *out_is_osi = 0;
     
-    switch (field_off) {
-        /* Scheduler element header (rwip_elt_t / sch_arb_elt_t) */
-        case 0x00: return "next";           /* Next in list */
-        case 0x04: return "prev";           /* Previous in list */
-        case 0x08: return "time_lo";        /* Target time (low) */
-        case 0x0c: return "time_hi";        /* Target time (high) or type */
-        case 0x10: return "interval";       /* Event interval (slots) */
-        case 0x14: return "duration";       /* Duration (us) */
-        case 0x18: return "minoffset";      /* Min offset */
-        case 0x1c: return "maxoffset";      /* Max offset */
-        case 0x20: return "prio_idx";       /* Priority index */
-        case 0x24: return "stop_cb";        /* Stop callback */
-        case 0x28: return "cancel_cb";      /* Cancel callback */
-        case 0x2c: return "start_cb";       /* Start callback */
+    /* Check if this is in the OSI function table region */
+    if (off >= BLE_OSI_FUNCS_BASE && off < BLE_OSI_FUNCS_END) {
+        *out_is_osi = 1;
+        uint32_t osi_off = off - BLE_OSI_FUNCS_BASE;
+        *out_cs_idx = osi_off / 4;  /* Function index */
         
-        /* Activity parameters */
-        case 0x30: return "act_id";         /* Activity ID */
-        case 0x34: return "state";          /* Activity state */
-        case 0x38: return "txdesc_ptr";     /* TX descriptor pointer */
-        case 0x3c: return "rxdesc_ptr";     /* RX descriptor pointer */
-        case 0x40: return "cs_ptr";         /* Control structure ptr */
-        case 0x44: return "env_ptr";        /* Environment pointer */
+        /* ESP-IDF BLE OSI function names (from osi_funcs_t) */
+        static const char *osi_names[] = {
+            "set_isr",              /* 0: set_isr_hlevel_wrapper */
+            "ints_on",              /* 1: xt_ints_on */
+            "int_disable",          /* 2: interrupt_hlevel_disable */
+            "int_restore",          /* 3: interrupt_hlevel_restore */
+            "task_yield",           /* 4: task_yield */
+            "task_yield_isr",       /* 5: task_yield_from_isr */
+            "semphr_create",        /* 6: semphr_create_wrapper */
+            "semphr_delete",        /* 7: semphr_delete_wrapper */
+            "semphr_take_isr",      /* 8: semphr_take_from_isr_wrapper */
+            "semphr_give_isr",      /* 9: semphr_give_from_isr_wrapper */
+            "semphr_take",          /* 10: semphr_take_wrapper */
+            "semphr_give",          /* 11: semphr_give_wrapper */
+            "mutex_create",         /* 12: mutex_create_wrapper */
+            "mutex_delete",         /* 13: mutex_delete_wrapper */
+            "mutex_lock",           /* 14: mutex_lock_wrapper */
+            "mutex_unlock",         /* 15: mutex_unlock_wrapper */
+            "queue_create",         /* 16: queue_create_hlevel_wrapper */
+            "queue_delete",         /* 17: queue_delete_hlevel_wrapper */
+            "queue_send",           /* 18: queue_send_hlevel_wrapper */
+            "queue_send_isr",       /* 19: queue_send_from_isr_hlevel_wrapper */
+            "queue_recv",           /* 20: queue_recv_hlevel_wrapper */
+            "queue_recv_isr",       /* 21: queue_recv_from_isr_hlevel_wrapper */
+            "task_create",          /* 22: task_create_wrapper */
+            "task_delete",          /* 23: task_delete_wrapper */
+            "is_in_isr",            /* 24: is_in_isr_wrapper */
+            "cause_sw_intr",        /* 25: cause_sw_intr_to_core_wrapper */
+            "malloc",               /* 26: valloc */
+            "malloc_internal",      /* 27: malloc_internal_wrapper */
+            "free",                 /* 28: free */
+            "read_mac",             /* 29: read_mac_wrapper */
+            "srand",                /* 30: srand_wrapper */
+            "rand",                 /* 31: rand_wrapper */
+            "lpcycles_2_us",        /* 32: btdm_lpcycles_2_us */
+            "us_2_lpcycles",        /* 33: btdm_us_2_lpcycles */
+            "sleep_check",          /* 34: btdm_sleep_check_duration */
+            "sleep_enter_p1",       /* 35: btdm_sleep_enter_phase1_wrapper */
+            "sleep_enter_p2",       /* 36: btdm_sleep_enter_phase2_wrapper */
+            "reserved_37",          /* 37: (reserved/unused) */
+            "reserved_38",          /* 38: (reserved/unused) */
+            "sleep_exit_p3",        /* 39: btdm_sleep_exit_phase3_wrapper */
+            "bt_wakeup_req",        /* 40: coex_bt_wakeup_request */
+            "bt_wakeup_end",        /* 41: coex_bt_wakeup_request_end */
+            "coex_bt_req",          /* 42: coex_bt_request_wrapper */
+            "coex_bt_rel",          /* 43: coex_bt_release_wrapper */
+            "coex_reg_bt_cb",       /* 44: coex_register_bt_cb_wrapper */
+            "coex_bb_lock",         /* 45: coex_bb_reset_lock_wrapper */
+            "coex_bb_unlock",       /* 46: coex_bb_reset_unlock_wrapper */
+            "coex_schm_reg",        /* 47: coex_schm_register_btdm_callback_wrapper */
+            "coex_stat_clr",        /* 48: coex_schm_status_bit_clear_wrapper */
+            "coex_stat_set",        /* 49: coex_schm_status_bit_set_wrapper */
+            "coex_intv_get",        /* 50: coex_schm_interval_get_wrapper */
+            "coex_period_get",      /* 51: coex_schm_curr_period_get_wrapper */
+            "coex_phase_get",       /* 52: coex_schm_curr_phase_get_wrapper */
+            "wifi_chan_get",        /* 53: coex_wifi_channel_get_wrapper */
+            "wifi_chan_cb_reg",     /* 54: coex_register_wifi_channel_change_callback_wrapper */
+            "set_int_handler",      /* 55: xt_set_interrupt_handler */
+            "int_l3_disable",       /* 56: interrupt_l3_disable */
+            "int_l3_restore",       /* 57: interrupt_l3_restore */
+            "cust_queue_create",    /* 58: customer_queue_create_hlevel_wrapper */
+            "coex_version_get",     /* 59: coex_version_get_wrapper */
+            "patch_apply",          /* 60: patch_apply */
+        };
         
-        /* Channel/PHY parameters */
-        case 0x48: return "ch_map[0]";      /* Channel map byte 0-3 */
-        case 0x4c: return "ch_map[4]";      /* Channel map byte 4 + hop */
-        case 0x50: return "acc_addr";       /* Access address */
-        case 0x54: return "crc_init";       /* CRC init value */
-        case 0x58: return "win_size";       /* Window size/offset */
-        case 0x5c: return "evt_cnt";        /* Event counter */
-        case 0x60: return "conn_intv";      /* Connection interval */
-        
-        default:
-            return NULL;  /* Unknown field */
+        if (*out_cs_idx < (int)(sizeof(osi_names)/sizeof(osi_names[0]))) {
+            return osi_names[*out_cs_idx];
+        }
+        return NULL;
     }
+    
+    /* Check if this is in the queue header region (before first CS) */
+    if (off >= EM_BLE_CS_OFFSET && off < BLE_CS_FIRST_ENTRY) {
+        uint32_t hdr_off = off - EM_BLE_CS_OFFSET;  /* Relative to 0x2800 */
+        *out_cs_idx = -1;  /* Queue header, not a CS entry */
+        
+        /* Multiple co_list_t structures (16 bytes each) */
+        uint32_t list_idx = hdr_off / sizeof(co_list_t);
+        uint32_t field_off = hdr_off % sizeof(co_list_t);
+        
+        static const char *list_fields[] = { "head", "tail", "count", "max" };
+        static const char *list_names[] = {
+            "ready", "alarm", "scan", "adv", "conn", "init",
+            "prog", "wait", "defer", "pend", "done", "free"
+        };
+        
+        if (list_idx < 12 && (field_off / 4) < 4) {
+            /* Return combined name like "ready.head" or "alarm.tail" */
+            static char buf[32];
+            snprintf(buf, sizeof(buf), "%s.%s", list_names[list_idx], list_fields[field_off / 4]);
+            return buf;
+        }
+        return NULL;
+    }
+    
+    /* Check if this is in the CS entry region (between queue headers and OSI table) */
+    if (off >= BLE_CS_FIRST_ENTRY && off < BLE_OSI_FUNCS_BASE) {
+        uint32_t cs_rel = off - BLE_CS_FIRST_ENTRY;  /* Relative to first CS */
+        *out_cs_idx = cs_rel / BLE_CS_STRIDE;
+        uint32_t field_off = cs_rel % BLE_CS_STRIDE;
+        
+        /* rwip_cs_t structure (48 bytes = 0x30) */
+        switch (field_off) {
+            case 0x00: return "next";       /* Next element in list */
+            case 0x04: return "prev";       /* Previous element */
+            case 0x08: return "parent";     /* Parent activity */
+            case 0x0C: return "cb";         /* Callback function */
+            case 0x10: return "env";        /* Environment pointer */
+            case 0x14: return "state";      /* Activity state */
+            case 0x18: return "time";       /* Target time */
+            case 0x1C: return "interval";   /* Event interval */
+            case 0x20: return "rxdesc";     /* RX descriptor pointer */
+            case 0x24: return "txdesc";     /* TX descriptor pointer */
+            case 0x28: return "flags";      /* Flags */
+            case 0x2C: return "type";       /* Activity type */
+            default:
+                return NULL;
+        }
+    }
+    
+    /* Post-OSI region (0x2A60+) - more CS entries or data */
+    if (off >= BLE_OSI_FUNCS_END && off < EM_KEY_OFFSET) {
+        uint32_t post_rel = off - BLE_OSI_FUNCS_END;
+        *out_cs_idx = 8 + (post_rel / BLE_CS_STRIDE);  /* Continue CS numbering */
+        uint32_t field_off = post_rel % BLE_CS_STRIDE;
+        
+        switch (field_off) {
+            case 0x00: return "next";
+            case 0x04: return "prev";
+            case 0x08: return "parent";
+            case 0x0C: return "cb";
+            case 0x10: return "env";
+            case 0x14: return "state";
+            case 0x18: return "time";
+            case 0x1C: return "interval";
+            case 0x20: return "rxdesc";
+            case 0x24: return "txdesc";
+            case 0x28: return "flags";
+            case 0x2C: return "type";
+            default:
+                return NULL;
+        }
+    }
+    
+    return NULL;
 }
 
 /* Debug helper macros */
