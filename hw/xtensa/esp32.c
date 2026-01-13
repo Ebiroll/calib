@@ -102,6 +102,13 @@ static int btdm_em_debug_level = 1;
 #define BLE_EVENTINT_INTSTAT_BIT    (1 << 8)   /* Event done interrupt */
 #define BLE_SWINT_INTSTAT_BIT       (1 << 9)   /* Software interrupt */
 
+/* EM region boundaries for BLE CS detection */
+#define EM_BLE_END_OFFSET   0x3000  /* End of BLE region in EM */
+
+/* Forward declarations */
+static void btdm_state_init(void);
+static void ble_force_start_timer(void);
+
 /* BLE timer state */
 static struct {
     QEMUTimer *timer;
@@ -145,7 +152,31 @@ static uint64_t btdm_em_read(void *opaque, hwaddr addr, unsigned size) {
 
 static void btdm_em_write(void *opaque, hwaddr addr, uint64_t val, unsigned size) {
     uint8_t *em_ptr = (uint8_t *)opaque;
+    static bool ble_timer_force_started = false;
+    static bool osi_table_written = false;
+    static int ble_cs_write_count = 0;
+    
     memcpy(em_ptr + addr, &val, size);
+    
+    /* Detect when OSI table is fully written (last entry at 0x2A50) */
+    if (!osi_table_written && addr >= 0x2A50 && addr < 0x2A60) {
+        osi_table_written = true;
+        fprintf(stderr, ">>> BTDM: OSI table write complete (addr 0x%04" HWADDR_PRIx ")\n", addr);
+    }
+    
+    /* Only count post-OSI CS writes (0x2A60-0x2C00) AFTER OSI table is written */
+    if (!ble_timer_force_started && osi_table_written && 
+        addr >= BLE_OSI_FUNCS_END && addr < 0x2C00) {
+        ble_cs_write_count++;
+        if (ble_cs_write_count >= 50) {
+            /* Post-OSI CS writes detected - initialization should be complete */
+            ble_timer_force_started = true;
+            fprintf(stderr, ">>> BTDM: Force-starting BLE timer (after %d post-OSI CS writes at 0x%04" HWADDR_PRIx ")\n", 
+                    ble_cs_write_count, addr);
+            ble_force_start_timer();
+            fprintf(stderr, ">>> BTDM: Timer force-start complete, enabled=%d\n", ble_timer_state.enabled);
+        }
+    }
     
     /* Skip zero-value writes (initialization spam) unless debug >= 3 */
     if (val == 0 && btdm_em_debug_level < 3) {
@@ -318,6 +349,10 @@ static struct {
     uint32_t blebdaddrl;        /* 0x224 */
     uint32_t blebdaddru;        /* 0x228 */
     uint32_t blecurrentrxdescptr; /* 0x22C */
+    uint32_t bledeepcntl;       /* 0x230 - Deep sleep control */
+    uint32_t bleslpdur;         /* 0x234 - Sleep duration */
+    uint32_t blesleepcntl;      /* 0x238 - Sleep mode control */
+    uint32_t blewkuptim;        /* 0x23C - Wakeup timer */
     uint32_t blediagcntl;       /* 0x250 */
     uint32_t blediagstat;       /* 0x254 */
     uint32_t bleerrortypestat;  /* 0x260 */
@@ -404,6 +439,11 @@ static void btdm_state_init(void)
     btdm_state.blebdaddrl = 0x00000000;
     btdm_state.blebdaddru = 0x00000000;
     btdm_state.blecurrentrxdescptr = 0x00000000;
+    /* Deep sleep control - bit 31 must be 0 (not in deep sleep) */
+    btdm_state.bledeepcntl = 0x00000000;
+    btdm_state.bleslpdur = 0x00000000;
+    btdm_state.blesleepcntl = 0x00000000;
+    btdm_state.blewkuptim = 0x00000000;
     btdm_state.blediagcntl = 0x00000000;
     btdm_state.blediagstat = 0x00000000;
     btdm_state.bleerrortypestat = 0x00000000;
@@ -501,6 +541,11 @@ static uint64_t phy_mmio_read(void *opaque, hwaddr addr, unsigned size)
     case 0x224: val = btdm_state.blebdaddrl; break;
     case 0x228: val = btdm_state.blebdaddru; break;
     case 0x22C: val = btdm_state.blecurrentrxdescptr; break;
+    /* Deep sleep registers - bit 31 always reads as 0 (not sleeping in emulation) */
+    case 0x230: val = btdm_state.bledeepcntl & ~(1u << 31); break;
+    case 0x234: val = btdm_state.bleslpdur; break;
+    case 0x238: val = btdm_state.blesleepcntl & ~(1u << 31); break;
+    case 0x23C: val = btdm_state.blewkuptim; break;
     case 0x250: val = btdm_state.blediagcntl; break;
     case 0x254: val = btdm_state.blediagstat; break;
     case 0x260: val = btdm_state.bleerrortypestat; break;
@@ -546,7 +591,14 @@ static uint64_t phy_mmio_read(void *opaque, hwaddr addr, unsigned size)
 
 static void phy_mmio_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
 {
+    static int write_count = 0;
     btdm_state_init();
+    
+    /* Log first 50 writes and writes to key registers */
+    if (write_count < 50 || addr == 0x200 || addr == 0x20C) {
+        qemu_log("PHY_WR[0x%03" PRIx64 "] <- 0x%08" PRIx64 " (count=%d)\n", 
+                 (uint64_t)addr, val, ++write_count);
+    }
 
     switch (addr) {
     /* BR/EDR Section (offset 0x000-0x1FF) */
@@ -604,18 +656,26 @@ static void phy_mmio_write(void *opaque, hwaddr addr, uint64_t val, unsigned siz
     case 0x1E0: btdm_state.reg_1e0 = val; break;
     /* BLE Section (offset 0x200+) */
     case 0x200: 
+        qemu_log("BTDM: BLECNTL write 0x%08" PRIx64 " (was 0x%08x)\n", val, btdm_state.blecntl);
         btdm_state.blecntl = val;
         if (val & (1 << 31)) {
-            qemu_log("BTDM: Guest requested BLE Master Soft Reset\n");
-            /* Auto-clear bit 31 */
-            btdm_state.blecntl &= ~(1 << 31);
+            qemu_log("BTDM: Guest requested BLE Master Soft Reset (MASTER_SOFT_RST)\n");
+            /* Auto-clear bit 31 (MASTER_SOFT_RST) and bit 30 (reset busy/ack) */
+            btdm_state.blecntl &= ~((1 << 31) | (1 << 30));
+        }
+        /* Also clear bit 30 if set alone (MASTER_TGSOFT_RST) */
+        if (val & (1 << 30)) {
+            btdm_state.blecntl &= ~(1 << 30);
         }
         /* Update BLE timer based on enable bit */
         ble_timer_update();
         break;
     case 0x204: btdm_state.bleversion = val; break;
     case 0x208: btdm_state.bleconf = val; break;
-    case 0x20C: btdm_state.bleintcntl = val; break;
+    case 0x20C: 
+        qemu_log("BTDM: BLEINTCNTL write 0x%08" PRIx64 " (enables interrupts)\n", val);
+        btdm_state.bleintcntl = val; 
+        break;
     case 0x210: btdm_state.bleintstat = val; break;
     case 0x214: btdm_state.bleintrawstat = val; break;
     case 0x218:
@@ -633,6 +693,16 @@ static void phy_mmio_write(void *opaque, hwaddr addr, uint64_t val, unsigned siz
     case 0x224: btdm_state.blebdaddrl = val; break;
     case 0x228: btdm_state.blebdaddru = val; break;
     case 0x22C: btdm_state.blecurrentrxdescptr = val; break;
+    /* Deep sleep registers - auto-clear bit 31 on write */
+    case 0x230: 
+        btdm_state.bledeepcntl = val & ~(1u << 31);
+        if (val & (1 << 31)) {
+            qemu_log("BTDM: Deep sleep requested but ignored in emulation\n");
+        }
+        break;
+    case 0x234: btdm_state.bleslpdur = val; break;
+    case 0x238: btdm_state.blesleepcntl = val & ~(1u << 31); break;
+    case 0x23C: btdm_state.blewkuptim = val; break;
     case 0x250: btdm_state.blediagcntl = val; break;
     case 0x254: btdm_state.blediagstat = val; break;
     case 0x260: btdm_state.bleerrortypestat = val; break;
@@ -685,7 +755,25 @@ static const MemoryRegionOps phy_mmio_ops = {
 /* BLE timer callback - generates periodic interrupts for the BLE scheduler */
 static void ble_timer_cb(void *opaque)
 {
+    static int cb_count = 0;
+    static int warmup_ticks = 0;
+    
     if (!ble_timer_state.enabled) {
+        return;
+    }
+    
+    cb_count++;
+    
+    /* Warmup period: run timer but don't raise IRQ for first 100 ticks (~62.5ms) */
+    /* This ensures interrupt handlers are fully registered before we fire */
+    if (warmup_ticks < 100) {
+        warmup_ticks++;
+        if (warmup_ticks == 100) {
+            fprintf(stderr, ">>> BLE Timer: Warmup complete, starting interrupt generation\n");
+        }
+        /* Reschedule without raising IRQ */
+        timer_mod(ble_timer_state.timer, 
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + ble_timer_state.period_ns);
         return;
     }
 
@@ -707,6 +795,11 @@ static void ble_timer_cb(void *opaque)
         btdm_state.bleintrawstat |= BLE_EVENTINT_INTSTAT_BIT;
     }
     
+    /* Set SLPINT when waking from sleep to signal scheduler */
+    if ((btdm_state.blebasetimecnt & 0xF) == 0) {
+        btdm_state.bleintrawstat |= BLE_SLPINT_INTSTAT_BIT;
+    }
+    
     /* Check which enabled interrupts should fire */
     uint32_t pending = btdm_state.bleintrawstat & btdm_state.bleintcntl;
     if (pending) {
@@ -714,6 +807,12 @@ static void ble_timer_cb(void *opaque)
         if (ble_timer_state.irq) {
             qemu_irq_raise(ble_timer_state.irq);
         }
+    }
+    
+    /* Debug: log every 1000 callbacks (~625ms) */
+    if (++cb_count % 1000 == 0) {
+        qemu_log("BLE Timer: tick=%d, rawstat=0x%x, intcntl=0x%x, pending=0x%x\n",
+                 cb_count, btdm_state.bleintrawstat, btdm_state.bleintcntl, pending);
     }
 
     /* Reschedule the timer */
@@ -748,6 +847,21 @@ static void ble_timer_update(void)
         ble_timer_state.enabled = false;
         timer_del(ble_timer_state.timer);
         qemu_log("BLE Timer: Stopped\n");
+    }
+}
+
+/* Force-start BLE timer when ROM bypasses register writes */
+static void ble_force_start_timer(void)
+{
+    fprintf(stderr, ">>> ble_force_start_timer: timer=%p, blecntl=0x%x\n", 
+            (void*)ble_timer_state.timer, btdm_state.blecntl);
+    btdm_state_init();
+    btdm_state.blecntl |= 0x1;  /* Set RWBLE_EN */
+    btdm_state.bleintcntl = 0x137;  /* Enable CSCNT, RXINT, SLPINT, FINETGT, GROSSTGT, EVENTINT */
+    if (ble_timer_state.timer) {
+        ble_timer_update();
+    } else {
+        fprintf(stderr, ">>> WARNING: BLE timer not initialized yet!\n");
     }
 }
 
