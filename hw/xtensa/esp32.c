@@ -127,26 +127,16 @@ static uint64_t btdm_em_read(void *opaque, hwaddr addr, unsigned size) {
         fprintf(stderr, "EM_RD NVDS 0x%04" HWADDR_PRIx " -> 0x%08x\n", addr, val);
     }
     
-    /* Print full RX descriptor when reading RXSTAT (first field) */
+    /* Print descriptor details when reading from descriptor areas */
     if (btdm_em_debug_level >= 3) {
         if (addr >= EM_BT_RXDESC_OFFSET && addr < EM_BT_TXDESC_OFFSET) {
-            uint32_t desc_idx = (addr - EM_BT_RXDESC_OFFSET) / sizeof(em_bt_rxdesc_t);
-            uint32_t desc_off = (addr - EM_BT_RXDESC_OFFSET) % sizeof(em_bt_rxdesc_t);
-            if (desc_off == 0) {
-                em_bt_rxdesc_t *desc = (em_bt_rxdesc_t *)(em_ptr + EM_BT_RXDESC_OFFSET + desc_idx * sizeof(em_bt_rxdesc_t));
-                fprintf(stderr, "BT_RXDESC[%d] @ EM+0x%04x:\n", desc_idx, (uint32_t)(EM_BT_RXDESC_OFFSET + desc_idx * sizeof(em_bt_rxdesc_t)));
-                fprintf(stderr, "  rxstat=0x%04x bt_hdr=0x%04x acl_hdr=0x%04x data_ptr=0x%04x\n",
-                        desc->rxstat, desc->bt_header, desc->acl_header, desc->data_ptr);
-            }
-        } else if (addr >= EM_BT_TXDESC_OFFSET && addr < EM_BLE_RXDESC_OFFSET) {
-            uint32_t desc_idx = (addr - EM_BT_TXDESC_OFFSET) / sizeof(em_bt_txdesc_t);
-            uint32_t desc_off = (addr - EM_BT_TXDESC_OFFSET) % sizeof(em_bt_txdesc_t);
-            if (desc_off == 0) {
-                em_bt_txdesc_t *desc = (em_bt_txdesc_t *)(em_ptr + EM_BT_TXDESC_OFFSET + desc_idx * sizeof(em_bt_txdesc_t));
-                fprintf(stderr, "BT_TXDESC[%d] @ EM+0x%04x:\n", desc_idx, (uint32_t)(EM_BT_TXDESC_OFFSET + desc_idx * sizeof(em_bt_txdesc_t)));
-                fprintf(stderr, "  txctrl=0x%04x bt_hdr=0x%04x acl_hdr=0x%04x data_ptr=0x%04x\n",
-                        desc->txctrl, desc->bt_header, desc->acl_header, desc->txdataptr);
-            }
+            uint32_t desc_off = addr - EM_BT_RXDESC_OFFSET;
+            uint32_t desc_idx = desc_off / EM_BT_RXDESC_STRIDE;
+            fprintf(stderr, "BT_RXDESC[%d] read @ EM+0x%04" HWADDR_PRIx "\n", desc_idx, addr);
+        } else if (addr >= EM_BT_TXDESC_OFFSET && addr < 0x2600) {
+            uint32_t desc_off = addr - EM_BT_TXDESC_OFFSET;
+            uint32_t desc_idx = desc_off / EM_BT_TXDESC_STRIDE;
+            fprintf(stderr, "BT_TXDESC[%d] read @ EM+0x%04" HWADDR_PRIx "\n", desc_idx, addr);
         }
     }
     
@@ -157,25 +147,91 @@ static void btdm_em_write(void *opaque, hwaddr addr, uint64_t val, unsigned size
     uint8_t *em_ptr = (uint8_t *)opaque;
     memcpy(em_ptr + addr, &val, size);
     
-    if (btdm_em_debug_level >= 2) {
-        fprintf(stderr, "EM_WR [%s] 0x%04" HWADDR_PRIx " (%d) <- 0x%0*" PRIx64 "%s\n",
-                 EM_REGION_NAME(addr), addr, size, size*2, val, em_field_comment(addr, (uint32_t)val));
+    /* Skip zero-value writes (initialization spam) unless debug >= 3 */
+    if (val == 0 && btdm_em_debug_level < 3) {
+        return;
     }
     
-    /* Log descriptor writes for debugging */
-    if (btdm_em_debug_level >= 3) {
-        /* Check if this could be an RX descriptor */
-        if (addr >= EM_BT_RXDESC_OFFSET && addr < EM_BT_TXDESC_OFFSET) {
-            uint32_t desc_idx = (addr - EM_BT_RXDESC_OFFSET) / sizeof(em_bt_rxdesc_t);
-            fprintf(stderr, "  -> BT_RXDESC[%d] write\n", desc_idx);
-        } else if (addr >= EM_BT_TXDESC_OFFSET && addr < EM_BLE_RXDESC_OFFSET) {
-            uint32_t desc_idx = (addr - EM_BT_TXDESC_OFFSET) / sizeof(em_bt_txdesc_t);
-            fprintf(stderr, "  -> BT_TXDESC[%d] write\n", desc_idx);
-        } else if (addr >= EM_BLE_RXDESC_OFFSET && addr < EM_BLE_TXDESC_OFFSET) {
-            fprintf(stderr, "  -> BLE_RXDESC region write\n");
-        } else if (addr >= EM_BLE_TXDESC_OFFSET && addr < EM_BLE_CS_OFFSET) {
-            fprintf(stderr, "  -> BLE_TXDESC region write\n");
+    /* Log TX descriptor writes (only non-zero) */
+    if (addr >= EM_BT_TXDESC_OFFSET && addr < 0x2600) {
+        uint32_t desc_off = addr - EM_BT_TXDESC_OFFSET;
+        uint32_t desc_idx = desc_off / EM_BT_TXDESC_STRIDE;
+        uint32_t field_off = desc_off % EM_BT_TXDESC_STRIDE;
+        const char *field_name = "";
+        switch (field_off) {
+            case 0x00: field_name = "TXCTRL"; break;
+            case 0x02: field_name = "BT_HDR"; break;
+            case 0x04: field_name = "ACL_HDR"; break;
+            case 0x06: field_name = "DATA_PTR"; break;
+            case 0x08: field_name = "LMP_PTR"; break;
+            default: field_name = "???"; break;
         }
+        fprintf(stderr, "EM_WR [BT_TXDESC%d.%s] 0x%04" HWADDR_PRIx " <- 0x%0*" PRIx64 "\n",
+                desc_idx, field_name, addr, size*2, val);
+        /* If TXCTRL write with bit 15 cleared, TX is being triggered */
+        if (field_off == 0x00 && size >= 2 && (val & 0x8000) == 0 && val != 0) {
+            fprintf(stderr, "  >>> TX TRIGGERED! (tx_ready cleared)\n");
+        }
+    }
+    /* Log RX descriptor writes (only non-zero) */
+    else if (addr >= EM_BT_RXDESC_OFFSET && addr < EM_BT_TXDESC_OFFSET) {
+        uint32_t desc_off = addr - EM_BT_RXDESC_OFFSET;
+        uint32_t desc_idx = desc_off / EM_BT_RXDESC_STRIDE;
+        fprintf(stderr, "EM_WR [BT_RXDESC%d] 0x%04" HWADDR_PRIx " <- 0x%0*" PRIx64 "\n",
+                desc_idx, addr, size*2, val);
+    }
+    /* Log BLE_CS writes - skip SENTINEL spam unless debug >= 3 */
+    else if (addr >= EM_BLE_CS_OFFSET && addr < EM_KEY_OFFSET) {
+        uint32_t v = (uint32_t)val;
+        /* Skip SENTINEL and em_ptr spam at lower debug levels */
+        if (btdm_em_debug_level < 3) {
+            if (v == BLE_CS_SENTINEL) return;
+            /* Also skip repeated em_ptr writes to list management fields */
+            if ((v >= 0x3ffb0000) && (v < 0x3ffb8000) && 
+                (addr < 0x28d0)) return;  /* Skip list head updates */
+        }
+        
+        /* Get field name from offset */
+        const char *field_name = ble_cs_field_name(addr);
+        
+        /* Build annotation for value */
+        const char *annotation = "";
+        if (size == 4) {
+            if (v == BLE_CS_SENTINEL) {
+                annotation = " ; SENTINEL";
+            } else if (v == 0xb33fffff) {
+                annotation = " ; SPINLOCK_FREE";
+            } else if (v == 0x0000cdcd) {
+                annotation = " ; SPINLOCK_TAKEN";
+            } else if (v == 0xfadebead) {
+                annotation = " ; NVDS_MAGIC";
+            } else if (v == 0xffffffff) {
+                annotation = " ; INVALID";
+            } else if ((v >= 0x40000000) && (v < 0x50000000)) {
+                annotation = " ; code_ptr";
+            } else if ((v >= 0x3ffb0000) && (v < 0x3ffb8000)) {
+                annotation = " ; em_ptr";
+            } else if ((v >= 0x3ff00000) && (v < 0x40000000)) {
+                annotation = " ; dram_ptr";
+            }
+        }
+        
+        /* Compute CS entry index */
+        uint32_t cs_idx = (addr - EM_BLE_CS_OFFSET) / BLE_CS_STRIDE;
+        
+        if (field_name) {
+            fprintf(stderr, "EM_WR [BLE_CS%d.%s] 0x%04" HWADDR_PRIx " (%d) <- 0x%0*" PRIx64 "%s\n",
+                    cs_idx, field_name, addr, size, size*2, val, annotation);
+        } else {
+            /* Unknown field - show raw offset */
+            uint32_t field_off = (addr - EM_BLE_CS_OFFSET) % BLE_CS_STRIDE;
+            fprintf(stderr, "EM_WR [BLE_CS%d+0x%02x] 0x%04" HWADDR_PRIx " (%d) <- 0x%0*" PRIx64 "%s\n",
+                    cs_idx, field_off, addr, size, size*2, val, annotation);
+        }
+    }
+    else if (btdm_em_debug_level >= 2) {
+        fprintf(stderr, "EM_WR [%s] 0x%04" HWADDR_PRIx " (%d) <- 0x%0*" PRIx64 "%s\n",
+                 EM_REGION_NAME(addr), addr, size, size*2, val, em_field_comment(addr, (uint32_t)val));
     }
 }
 

@@ -203,15 +203,74 @@ typedef struct __attribute__((packed)) {
     uint16_t txauxptr;     /* 0x06: Aux pointer */
 } em_ble_txdesc_t;
 
+/*
+ * RivieraWaves Kernel Element (ke_elem) / Activity structure
+ * Base structure for scheduler entries (ADV, SCAN, CONN, etc.)
+ * Size varies by activity type, but header is common.
+ */
+typedef struct __attribute__((packed)) {
+    uint32_t next;          /* 0x00: Next element in linked list (EM addr or sentinel) */
+    uint32_t prev;          /* 0x04: Previous element */
+    uint32_t time;          /* 0x08: Scheduling time / priority */
+    uint32_t type;          /* 0x0C: Activity type / state */
+} rwip_elt_t;
+
+/*
+ * BLE Control Structure (Activity descriptor)
+ * Located in EM at 0x2800+, multiple entries with variable size
+ * Sentinel value: 0x3ffb2744 (empty list pointer)
+ */
+typedef struct __attribute__((packed)) {
+    /* List management (0x00-0x0F) */
+    uint32_t next;          /* 0x00: Next CS in linked list */
+    uint32_t prev;          /* 0x04: Previous CS */
+    uint32_t time;          /* 0x08: Target time for event */
+    uint32_t type_state;    /* 0x0C: Activity type + state */
+    
+    /* Activity parameters (0x10+) - varies by type */
+    uint32_t interval;      /* 0x10: Event interval */
+    uint32_t duration;      /* 0x14: Duration */
+    uint32_t aux_ptr;       /* 0x18: Aux data pointer */
+    uint32_t txdesc_ptr;    /* 0x1C: TX descriptor pointer */
+    uint32_t rxdesc_ptr;    /* 0x20: RX descriptor pointer */
+    uint32_t cs_ptr;        /* 0x24: Control structure pointer */
+    uint32_t env_ptr;       /* 0x28: Environment pointer */
+    uint32_t callback;      /* 0x2C: Completion callback */
+} rwip_cs_t;
+
+/* BLE_CS sentinel value (empty list marker) */
+#define BLE_CS_SENTINEL     0x3ffb2744
+
+/* Activity types (based on RivieraWaves) */
+#define RWIP_ACT_ADV        0x00    /* Advertising */
+#define RWIP_ACT_SCAN       0x01    /* Scanning */
+#define RWIP_ACT_INIT       0x02    /* Initiating */
+#define RWIP_ACT_CONN       0x03    /* Connection */
+
+/*
+ * BLE CS field name lookup
+ * Based on RivieraWaves ble_util_buf / sch_arb / llc structures
+ * CS entries are at 0x2800+ with 0x64 (100 byte) stride for ADV/SCAN
+ * Connection CS may be larger (0x80-0xA0 bytes)
+ */
+#define BLE_CS_STRIDE       0x64    /* 100 bytes per basic CS entry */
+#define BLE_CS_CONN_STRIDE  0x80    /* 128 bytes for connection CS */
+
 /* 
  * Known EM regions (offsets from 0x3FFB0000)
  * Total EM size is 32KB (0x8000 bytes)
+ * 
+ * Layout derived from ESP32 BT firmware analysis:
+ * - BT Link Control blocks: 0x1DEE+ (stride 0x66 = 102 bytes per link)
+ * - BT RX descriptors: 0x2382+ (stride 0x0E = 14 bytes, 4 entries)
+ * - BT TX descriptors: 0x23BA+ (stride 0x14 = 20 bytes per link*2)
+ * - FHS packet buffer: 0x262C
  */
 #define EM_NVDS_OFFSET          0x0000  /* NVDS magic at start */
-#define EM_BT_RXDESC_OFFSET     0x0800  /* BT RX descriptors */
-#define EM_BT_TXDESC_OFFSET     0x1000  /* BT TX descriptors */
-#define EM_BLE_RXDESC_OFFSET    0x1800  /* BLE RX descriptors */
-#define EM_BLE_TXDESC_OFFSET    0x2000  /* BLE TX descriptors */
+#define EM_BT_LINKCTRL_OFFSET   0x1D00  /* BT Link Control blocks (0x66 bytes each) */
+#define EM_BT_RXDESC_OFFSET     0x2382  /* BT RX descriptors (4 x 14 bytes) */
+#define EM_BT_TXDESC_OFFSET     0x23BA  /* BT TX descriptors (stride 0x14) */
+#define EM_BT_FHS_OFFSET        0x262C  /* FHS packet buffer */
 #define EM_BLE_CS_OFFSET        0x2800  /* BLE Control Structures */
 #define EM_KEY_OFFSET           0x3000  /* Encryption keys */
 #define EM_WHITELIST_OFFSET     0x3800  /* Whitelist entries */
@@ -221,13 +280,76 @@ typedef struct __attribute__((packed)) {
 #define EM_RTOS_OFFSET          0x7800  /* FreeRTOS TCB/stack area */
 #define EM_END_OFFSET           0x8000  /* End of EM */
 
+/* BT TX descriptor field offsets (from descriptor base) */
+#define EM_BT_TXDESC_CTRL_OFF   0x00  /* 0x23BA: TX control (bit 15 = tx_ready) */
+#define EM_BT_TXDESC_BTHDR_OFF  0x02  /* 0x23BC: BT header */
+#define EM_BT_TXDESC_ACLHDR_OFF 0x04  /* 0x23BE: ACL header */
+#define EM_BT_TXDESC_DATAPTR_OFF 0x06 /* 0x23C0: Data pointer */
+#define EM_BT_TXDESC_LMPPTR_OFF 0x08  /* 0x23C2: LMP pointer */
+#define EM_BT_TXDESC_STRIDE     0x14  /* 20 bytes per descriptor pair */
+
+/* BT RX descriptor field offsets */
+#define EM_BT_RXDESC_STRIDE     0x0E  /* 14 bytes per descriptor */
+
+/* BT Link Control block offsets (from 0x1DEE base, stride 0x66) */
+#define EM_BT_LC_STRIDE         0x66  /* 102 bytes per link */
+
+/*
+ * BLE CS field name lookup function
+ * Based on RivieraWaves ble_util_buf / sch_arb / llc structures
+ */
+static inline const char *ble_cs_field_name(uint32_t addr)
+{
+    /* Offset within the BLE_CS region (0x2800-0x3000) */
+    uint32_t cs_off = addr - EM_BLE_CS_OFFSET;  /* 0x2800 base */
+    
+    /* Compute field offset within a CS entry (using 0x64 stride) */
+    uint32_t field_off = cs_off % BLE_CS_STRIDE;
+    
+    switch (field_off) {
+        /* Scheduler element header (rwip_elt_t / sch_arb_elt_t) */
+        case 0x00: return "next";           /* Next in list */
+        case 0x04: return "prev";           /* Previous in list */
+        case 0x08: return "time_lo";        /* Target time (low) */
+        case 0x0c: return "time_hi";        /* Target time (high) or type */
+        case 0x10: return "interval";       /* Event interval (slots) */
+        case 0x14: return "duration";       /* Duration (us) */
+        case 0x18: return "minoffset";      /* Min offset */
+        case 0x1c: return "maxoffset";      /* Max offset */
+        case 0x20: return "prio_idx";       /* Priority index */
+        case 0x24: return "stop_cb";        /* Stop callback */
+        case 0x28: return "cancel_cb";      /* Cancel callback */
+        case 0x2c: return "start_cb";       /* Start callback */
+        
+        /* Activity parameters */
+        case 0x30: return "act_id";         /* Activity ID */
+        case 0x34: return "state";          /* Activity state */
+        case 0x38: return "txdesc_ptr";     /* TX descriptor pointer */
+        case 0x3c: return "rxdesc_ptr";     /* RX descriptor pointer */
+        case 0x40: return "cs_ptr";         /* Control structure ptr */
+        case 0x44: return "env_ptr";        /* Environment pointer */
+        
+        /* Channel/PHY parameters */
+        case 0x48: return "ch_map[0]";      /* Channel map byte 0-3 */
+        case 0x4c: return "ch_map[4]";      /* Channel map byte 4 + hop */
+        case 0x50: return "acc_addr";       /* Access address */
+        case 0x54: return "crc_init";       /* CRC init value */
+        case 0x58: return "win_size";       /* Window size/offset */
+        case 0x5c: return "evt_cnt";        /* Event counter */
+        case 0x60: return "conn_intv";      /* Connection interval */
+        
+        default:
+            return NULL;  /* Unknown field */
+    }
+}
+
 /* Debug helper macros */
 #define EM_REGION_NAME(off) \
-    ((off) < 0x0800 ? "NVDS" : \
-     (off) < 0x1000 ? "BT_RXDESC" : \
-     (off) < 0x1800 ? "BT_TXDESC" : \
-     (off) < 0x2000 ? "BLE_RXDESC" : \
-     (off) < 0x2800 ? "BLE_TXDESC" : \
+    ((off) < 0x1D00 ? "NVDS" : \
+     (off) < 0x2382 ? "BT_LC" : \
+     (off) < 0x23BA ? "BT_RXDESC" : \
+     (off) < 0x2600 ? "BT_TXDESC" : \
+     (off) < 0x2800 ? "BT_FHS" : \
      (off) < 0x3000 ? "BLE_CS" : \
      (off) < 0x3800 ? "KEY" : \
      (off) < 0x4000 ? "WHITELIST" : \
