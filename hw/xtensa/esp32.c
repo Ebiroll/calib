@@ -757,6 +757,7 @@ static void ble_timer_cb(void *opaque)
 {
     static int cb_count = 0;
     static int warmup_ticks = 0;
+    static int irq_cooldown = 0;  /* Cooldown counter to avoid interrupt storm */
     
     if (!ble_timer_state.enabled) {
         return;
@@ -782,21 +783,38 @@ static void ble_timer_cb(void *opaque)
     btdm_state.blebasetimecnt = (btdm_state.blebasetimecnt + 1) & 0x07FFFFFF;
     btdm_state.blefinetimecnt = (btdm_state.blefinetimecnt + 312) & 0x3FF;
 
+    /* Only generate interrupts if the previous one was acknowledged */
+    /* This prevents interrupt storm - firmware must clear intstat before we fire again */
+    if (btdm_state.bleintstat != 0) {
+        /* Previous interrupt not yet acknowledged, don't fire another */
+        timer_mod(ble_timer_state.timer, 
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + ble_timer_state.period_ns);
+        return;
+    }
+    
+    /* Also add a cooldown period - at least 16 timer ticks between IRQs */
+    if (irq_cooldown > 0) {
+        irq_cooldown--;
+        timer_mod(ble_timer_state.timer, 
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + ble_timer_state.period_ns);
+        return;
+    }
+
     /* Set CSCNT interrupt bit to wake up scheduler */
     btdm_state.bleintrawstat |= BLE_CSCNT_INTSTAT_BIT;
     
-    /* Also set FINETGTINT periodically (every 4 slots) for timer target events */
-    if ((btdm_state.blebasetimecnt & 0x3) == 0) {
+    /* Also set FINETGTINT periodically (every 64 slots ~ 40ms) for timer target events */
+    if ((btdm_state.blebasetimecnt & 0x3F) == 0) {
         btdm_state.bleintrawstat |= BLE_FINETGTINT_INTSTAT_BIT;
     }
     
-    /* Set EVENTINT periodically (every 8 slots) to complete advertising/scanning events */
-    if ((btdm_state.blebasetimecnt & 0x7) == 0) {
+    /* Set EVENTINT periodically (every 256 slots ~ 160ms) to complete advertising/scanning events */
+    if ((btdm_state.blebasetimecnt & 0xFF) == 0) {
         btdm_state.bleintrawstat |= BLE_EVENTINT_INTSTAT_BIT;
     }
     
-    /* Set SLPINT when waking from sleep to signal scheduler */
-    if ((btdm_state.blebasetimecnt & 0xF) == 0) {
+    /* Set SLPINT rarely (every 512 slots ~ 320ms) for sleep wake-up */
+    if ((btdm_state.blebasetimecnt & 0x1FF) == 0) {
         btdm_state.bleintrawstat |= BLE_SLPINT_INTSTAT_BIT;
     }
     
@@ -804,13 +822,17 @@ static void ble_timer_cb(void *opaque)
     uint32_t pending = btdm_state.bleintrawstat & btdm_state.bleintcntl;
     if (pending) {
         btdm_state.bleintstat |= pending;
+        /* Clear rawstat bits that we're now asserting */
+        btdm_state.bleintrawstat &= ~pending;
         if (ble_timer_state.irq) {
             qemu_irq_raise(ble_timer_state.irq);
+            /* Set cooldown - wait 16 ticks (~10ms) before considering another IRQ */
+            irq_cooldown = 16;
         }
     }
     
     /* Debug: log every 1000 callbacks (~625ms) */
-    if (++cb_count % 1000 == 0) {
+    if (cb_count % 1000 == 0) {
         qemu_log("BLE Timer: tick=%d, rawstat=0x%x, intcntl=0x%x, pending=0x%x\n",
                  cb_count, btdm_state.bleintrawstat, btdm_state.bleintcntl, pending);
     }
