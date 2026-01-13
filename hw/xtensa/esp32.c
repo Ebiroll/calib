@@ -530,7 +530,12 @@ static uint64_t phy_mmio_read(void *opaque, hwaddr addr, unsigned size)
     case 0x204: val = btdm_state.bleversion; break;
     case 0x208: val = btdm_state.bleconf; break;
     case 0x20C: val = btdm_state.bleintcntl; break;
-    case 0x210: val = btdm_state.bleintstat; break;
+    case 0x210: 
+        val = btdm_state.bleintstat;
+        if (val != 0) {
+            fprintf(stderr, ">>> BLE READ INTSTAT: 0x%x\n", val);
+        }
+        break;
     case 0x214: val = btdm_state.bleintrawstat; break;
     case 0x218: val = btdm_state.bleintack; break;
     case 0x21C:
@@ -680,6 +685,8 @@ static void phy_mmio_write(void *opaque, hwaddr addr, uint64_t val, unsigned siz
     case 0x214: btdm_state.bleintrawstat = val; break;
     case 0x218:
         /* BLEINTACK - writing 1 clears the corresponding interrupt bits */
+        fprintf(stderr, ">>> BLE INTACK: ack=0x%x, was intstat=0x%x\n", 
+                (unsigned)val, btdm_state.bleintstat);
         btdm_state.bleintack = val;
         btdm_state.bleintstat &= ~val;
         btdm_state.bleintrawstat &= ~val;
@@ -765,11 +772,12 @@ static void ble_timer_cb(void *opaque)
     
     cb_count++;
     
-    /* Warmup period: run timer but don't raise IRQ for first 1000 ticks (~625ms) */
-    /* This ensures interrupt handlers AND PHY calibration are fully complete before we fire */
-    if (warmup_ticks < 1000) {
+    /* Warmup period: run timer but don't raise IRQ for first 10000 ticks (~6.25s) */
+    /* This ensures PHY calibration AND controller enable are complete before we fire */
+    /* PHY calibration can take several seconds in QEMU due to emulation overhead */
+    if (warmup_ticks < 10000) {
         warmup_ticks++;
-        if (warmup_ticks == 1000) {
+        if (warmup_ticks == 10000) {
             fprintf(stderr, ">>> BLE Timer: Warmup complete, starting interrupt generation\n");
         }
         /* Reschedule without raising IRQ */
@@ -825,6 +833,8 @@ static void ble_timer_cb(void *opaque)
         /* Clear rawstat bits that we're now asserting */
         btdm_state.bleintrawstat &= ~pending;
         if (ble_timer_state.irq) {
+            fprintf(stderr, ">>> BLE IRQ: raising interrupt, pending=0x%x, intcntl=0x%x\n",
+                    pending, btdm_state.bleintcntl);
             qemu_irq_raise(ble_timer_state.irq);
             /* Set cooldown - wait 16 ticks (~10ms) before considering another IRQ */
             irq_cooldown = 16;
@@ -833,8 +843,8 @@ static void ble_timer_cb(void *opaque)
     
     /* Debug: log every 1000 callbacks (~625ms) */
     if (cb_count % 1000 == 0) {
-        qemu_log("BLE Timer: tick=%d, rawstat=0x%x, intcntl=0x%x, pending=0x%x\n",
-                 cb_count, btdm_state.bleintrawstat, btdm_state.bleintcntl, pending);
+        fprintf(stderr, ">>> BLE Timer: tick=%d, intstat=0x%x, intcntl=0x%x\n",
+                 cb_count, btdm_state.bleintstat, btdm_state.bleintcntl);
     }
 
     /* Reschedule the timer */
