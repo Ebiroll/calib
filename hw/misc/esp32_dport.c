@@ -122,6 +122,12 @@ static uint64_t esp32_dport_read(void *opaque, hwaddr addr, unsigned int size)
     case A_DPORT_SLAVE_SPI_CONFIG:
         r = s->slave_spi_config_reg;
         break;
+    case A_DPORT_BT_LPCK_DIV_INT:
+        r = s->bt_lpck_div_int;
+        break;
+    case A_DPORT_BT_LPCK_DIV_FRAC:
+        r = s->bt_lpck_div_frac;
+        break;
     }
 
     return r;
@@ -225,6 +231,12 @@ static void esp32_dport_write(void *opaque, hwaddr addr,
         s->slave_spi_config_reg = value;
         qemu_set_irq(s->flash_enc_en_gpio, FIELD_EX32(value, DPORT_SLAVE_SPI_CONFIG, SLAVE_SPI_ENCRYPT_ENABLE));
         qemu_set_irq(s->flash_dec_en_gpio, FIELD_EX32(value, DPORT_SLAVE_SPI_CONFIG, SLAVE_SPI_DECRYPT_ENABLE));
+        break;
+    case A_DPORT_BT_LPCK_DIV_INT:
+        s->bt_lpck_div_int = value;
+        break;
+    case A_DPORT_BT_LPCK_DIV_FRAC:
+        s->bt_lpck_div_frac = value;
         break;
     }
 }

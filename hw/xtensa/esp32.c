@@ -84,11 +84,25 @@ static const struct MemmapEntry {
 #define ESP32_SOC_RESET_RTC       0x8
 #define ESP32_SOC_RESET_ALL       (ESP32_SOC_RESET_RTC | ESP32_SOC_RESET_DIG)
 
+#include "bt_dbg.h"
+
+/* Debug level for EM access logging (0=off, 1=regions, 2=all, 3=verbose) */
+static int btdm_em_debug_level = 1;
+
 /* Intercepts the Data Plane (Exchange Memory) */
 static uint64_t btdm_em_read(void *opaque, hwaddr addr, unsigned size) {
     uint8_t *em_ptr = (uint8_t *)opaque; 
     uint32_t val = 0;
     memcpy(&val, em_ptr + addr, size);
+    
+    if (btdm_em_debug_level >= 2) {
+        qemu_log("EM_RD [%s] 0x%04" HWADDR_PRIx " (%d) -> 0x%0*x\n",
+                 EM_REGION_NAME(addr), addr, size, size*2, val);
+    } else if (btdm_em_debug_level >= 1 && addr < 0x10) {
+        /* Always log NVDS magic reads */
+        qemu_log("EM_RD NVDS 0x%04" HWADDR_PRIx " -> 0x%08x\n", addr, val);
+    }
+    
     return val;
 }
 
@@ -96,11 +110,23 @@ static void btdm_em_write(void *opaque, hwaddr addr, uint64_t val, unsigned size
     uint8_t *em_ptr = (uint8_t *)opaque;
     memcpy(em_ptr + addr, &val, size);
     
-    /* Log specific data writes like your ASCII '74' (0x4A) */
-    if (val == 0x4A) {
-        qemu_log("BTDM_EM: Data '74' written to buffer at offset 0x%" HWADDR_PRIx "\n", addr);
+    if (btdm_em_debug_level >= 2) {
+        qemu_log("EM_WR [%s] 0x%04" HWADDR_PRIx " (%d) <- 0x%0*" PRIx64 "\n",
+                 EM_REGION_NAME(addr), addr, size, size*2, val);
     }
-
+    
+    /* Log descriptor writes for debugging */
+    if (btdm_em_debug_level >= 3) {
+        /* Check if this could be an RX descriptor (14-byte aligned regions) */
+        if (addr >= EM_BT_RXDESC_OFFSET && addr < EM_BT_TXDESC_OFFSET) {
+            uint32_t desc_offset = (addr - EM_BT_RXDESC_OFFSET) % 14;
+            if (desc_offset == 0 && size >= 2) {
+                qemu_log("  -> BT_RXDESC RXSTAT write\n");
+            }
+        } else if (addr >= EM_BLE_RXDESC_OFFSET && addr < EM_BLE_TXDESC_OFFSET) {
+            qemu_log("  -> BLE_RXDESC region write\n");
+        }
+    }
 }
 
 static const MemoryRegionOps btdm_em_ops = {
