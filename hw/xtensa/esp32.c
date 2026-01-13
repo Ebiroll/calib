@@ -224,6 +224,9 @@ static const MemoryRegionOps bt_controller_ops = {
  * The BLE section starts at offset 0x200.
  */
 
+/* Simple monotonic clock counter for BTDM - increments on each read */
+static uint32_t btdm_clock_counter = 0;
+
 /* BTDM register state - covers both BR/EDR (0x000-0x1FF) and BLE (0x200+) sections */
 static struct {
     /* BR/EDR Section (offset 0x000-0x1FF) */
@@ -233,7 +236,7 @@ static struct {
     uint32_t btintstat;         /* 0x010 */
     uint32_t btintrawstat;      /* 0x014 */
     uint32_t btintack;          /* 0x018 */
-    uint32_t reg_01c;           /* 0x01C */
+    uint32_t clk_latch;         /* 0x01C - Clock latch register (bit31=sample, bits0-27=clock) */
     uint32_t reg_028;           /* 0x028 */
     uint32_t reg_02c;           /* 0x02C */
     uint32_t reg_030;           /* 0x030 */
@@ -306,7 +309,7 @@ static void btdm_state_init(void)
     btdm_state.btintstat = 0x00000000;
     btdm_state.btintrawstat = 0x00000001;
     btdm_state.btintack = 0x00000000;
-    btdm_state.reg_01c = 0x00000000;
+    btdm_state.clk_latch = 0x00000000;
     btdm_state.reg_028 = 0x00000000;
     btdm_state.reg_02c = 0x00000000;
     btdm_state.reg_030 = 0x00000000;
@@ -380,7 +383,11 @@ static uint64_t phy_mmio_read(void *opaque, hwaddr addr, unsigned size)
     case 0x010: val = btdm_state.btintstat; break;
     case 0x014: val = btdm_state.btintrawstat; break;
     case 0x018: val = btdm_state.btintack; break;
-    case 0x01C: val = btdm_state.reg_01c; break;
+    case 0x01C:
+        /* Clock latch register - return latched clock value with bit 31 cleared */
+        btdm_clock_counter += 312;  /* Simulate time passing (~312.5us per BT slot) */
+        val = btdm_state.clk_latch & 0x0FFFFFFF;  /* Bit 31 always reads as 0 (sample complete) */
+        break;
     case 0x028: val = btdm_state.reg_028; break;
     case 0x02C: val = btdm_state.reg_02c; break;
     case 0x030: val = btdm_state.reg_030; break;
@@ -469,7 +476,15 @@ static void phy_mmio_write(void *opaque, hwaddr addr, uint64_t val, unsigned siz
     case 0x010: btdm_state.btintstat = val; break;
     case 0x014: btdm_state.btintrawstat = val; break;
     case 0x018: btdm_state.btintack = val; break;
-    case 0x01C: btdm_state.reg_01c = val; break;
+    case 0x01C:
+        /* Clock latch register - when bit 31 is set, latch current clock and clear bit 31 */
+        if (val & 0x80000000) {
+            /* Sample request: latch current clock value, bit 31 cleared immediately */
+            btdm_state.clk_latch = (btdm_clock_counter & 0x07FFFFFF);  /* 27-bit clock value */
+        } else {
+            btdm_state.clk_latch = val;
+        }
+        break;
     case 0x028: btdm_state.reg_028 = val; break;
     case 0x02C: btdm_state.reg_02c = val; break;
     case 0x030: btdm_state.reg_030 = val; break;
