@@ -123,7 +123,78 @@ typedef struct __attribute__((packed)) {
 } em_ble_rxdesc_t;
 
 /*
- * TX Descriptor
+ * TX Control (offset 0x00)
+ */
+typedef union {
+    uint16_t val;
+    struct {
+        uint16_t tx_en       : 1;  /* Enable transmission */
+        uint16_t encrypt     : 1;  /* Enable encryption */
+        uint16_t retry_en    : 1;  /* Allow retries */
+        uint16_t flush       : 1;  /* Flush after TX */
+        uint16_t is_lmp      : 1;  /* LMP packet */
+        uint16_t is_poll     : 1;  /* POLL/NULL handling */
+        uint16_t reserved0   : 8;
+        uint16_t tx_done     : 1;  /* TX complete (set by HW) */
+        uint16_t tx_ready    : 1;  /* HW owns descriptor (clear to start TX) */
+    };
+} em_bt_txctrl_t;
+
+/*
+ * TX Data Pointer (offset 0x06)
+ */
+typedef union {
+    uint16_t val;
+    struct {
+        uint16_t offset : 13;  /* EM offset (added to 0x3FFB0000) */
+        uint16_t rfu    : 3;
+    };
+} em_bt_txdataptr_t;
+
+/*
+ * TX Rate / Modulation (offset 0x0A)
+ */
+typedef union {
+    uint16_t val;
+    struct {
+        uint16_t rate     : 3;  /* 1M, 2M, 3M (EDR) */
+        uint16_t power    : 4;  /* TX power index */
+        uint16_t is_edr   : 1;  /* EDR mode */
+        uint16_t reserved : 8;
+    };
+} em_bt_txrate_t;
+
+/*
+ * TX Status (offset 0x0C) - written by hardware after TX
+ */
+typedef union {
+    uint16_t val;
+    struct {
+        uint16_t retries  : 4;  /* Retry count */
+        uint16_t acked    : 1;  /* ACK received */
+        uint16_t flushed  : 1;  /* Packet flushed */
+        uint16_t timeout  : 1;  /* TX timeout */
+        uint16_t reserved : 9;
+    };
+} em_bt_txstat_t;
+
+/*
+ * BT TX Descriptor (14 bytes)
+ */
+typedef struct __attribute__((packed)) {
+    uint16_t txctrl;       /* 0x00: TX control (bit 15=tx_ready, clear to start TX) */
+    uint16_t bt_header;    /* 0x02: BT header (LT_ADDR, TYPE, FLOW, ARQN, SEQN, HEC) */
+    uint16_t acl_header;   /* 0x04: ACL header (LLID, FLOW, LENGTH) */
+    uint16_t txdataptr;    /* 0x06: Data pointer in EM */
+    uint16_t mic;          /* 0x08: MIC / CRC seed for encryption */
+    uint16_t txrate;       /* 0x0A: TX rate / modulation / power */
+    uint16_t txstat;       /* 0x0C: TX status (written by HW) */
+} em_bt_txdesc_t;
+
+_Static_assert(sizeof(em_bt_txdesc_t) == 14, "BT TX descriptor must be 14 bytes");
+
+/*
+ * BLE TX Descriptor
  */
 typedef struct __attribute__((packed)) {
     uint16_t txcntl;       /* 0x00: TX control */
@@ -198,6 +269,33 @@ static inline void em_bt_rxdesc_print(const em_bt_rxdesc_t *desc, uint32_t addr)
     qemu_log("  RSSI: %d dBm, CH: %d\n", (int8_t)rssi.rssi, rssi.channel);
     qemu_log("  RXCTRL: 0x%04x (enc=%d mic=%d edr=%d fhs=%d)\n",
              ctrl.val, ctrl.encrypted, ctrl.mic_ok, ctrl.is_edr, ctrl.is_fhs);
+}
+
+/* Debug print helper for TX descriptor */
+static inline void em_bt_txdesc_print(const em_bt_txdesc_t *desc, uint32_t addr)
+{
+    em_bt_txctrl_t ctrl = { .val = desc->txctrl };
+    em_bt_header_t hdr = { .raw = desc->bt_header };
+    em_acl_header_t acl = { .raw = desc->acl_header };
+    em_bt_txrate_t rate = { .val = desc->txrate };
+    em_bt_txstat_t stat = { .val = desc->txstat };
+    
+    qemu_log("BT_TXDESC @ 0x%08x:\n", addr);
+    qemu_log("  TXCTRL: 0x%04x (en=%d enc=%d retry=%d flush=%d lmp=%d poll=%d done=%d ready=%d)\n",
+             ctrl.val, ctrl.tx_en, ctrl.encrypt, ctrl.retry_en, ctrl.flush,
+             ctrl.is_lmp, ctrl.is_poll, ctrl.tx_done, ctrl.tx_ready);
+    qemu_log("  BT_HDR: 0x%04x (lt=%d type=%s flow=%d arqn=%d seqn=%d)\n",
+             hdr.raw, hdr.lt_addr, bt_pkt_type_name(hdr.type),
+             hdr.flow, hdr.arqn, hdr.seqn);
+    qemu_log("  ACL_HDR: 0x%04x (llid=%s flow=%d len=%d)\n",
+             acl.raw, acl_llid_name(acl.llid), acl.flow, acl.length);
+    qemu_log("  DATA_PTR: 0x%04x -> 0x%08x\n",
+             desc->txdataptr, EM_BASE_ADDR + (desc->txdataptr & 0x1FFF));
+    qemu_log("  MIC: 0x%04x\n", desc->mic);
+    qemu_log("  TXRATE: 0x%04x (rate=%d power=%d edr=%d)\n",
+             rate.val, rate.rate, rate.power, rate.is_edr);
+    qemu_log("  TXSTAT: 0x%04x (retries=%d ack=%d flush=%d timeout=%d)\n",
+             stat.val, stat.retries, stat.acked, stat.flushed, stat.timeout);
 }
 
 #endif /* ESP32_BT_DBG_H */

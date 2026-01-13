@@ -87,8 +87,8 @@ static const struct MemmapEntry {
 #include "bt_dbg.h"
 #include "qemu/timer.h"
 
-/* Debug level for EM access logging (0=off, 1=regions, 2=all, 3=verbose) */
-static int btdm_em_debug_level = 1;
+/* Debug level for EM access logging (0=off, 1=regions, 2=all, 3=verbose+desc) */
+static int btdm_em_debug_level = 3;
 
 /* BLE interrupt bits for BLEINTRAWSTAT/BLEINTSTAT */
 #define BLE_CSCNT_INTSTAT_BIT       (1 << 0)   /* Clock counter wrap */
@@ -120,11 +120,34 @@ static uint64_t btdm_em_read(void *opaque, hwaddr addr, unsigned size) {
     memcpy(&val, em_ptr + addr, size);
     
     if (btdm_em_debug_level >= 2) {
-        qemu_log("EM_RD [%s] 0x%04" HWADDR_PRIx " (%d) -> 0x%0*x\n",
+        fprintf(stderr, "EM_RD [%s] 0x%04" HWADDR_PRIx " (%d) -> 0x%0*x\n",
                  EM_REGION_NAME(addr), addr, size, size*2, val);
     } else if (btdm_em_debug_level >= 1 && addr < 0x10) {
         /* Always log NVDS magic reads */
-        qemu_log("EM_RD NVDS 0x%04" HWADDR_PRIx " -> 0x%08x\n", addr, val);
+        fprintf(stderr, "EM_RD NVDS 0x%04" HWADDR_PRIx " -> 0x%08x\n", addr, val);
+    }
+    
+    /* Print full RX descriptor when reading RXSTAT (first field) */
+    if (btdm_em_debug_level >= 3) {
+        if (addr >= EM_BT_RXDESC_OFFSET && addr < EM_BT_TXDESC_OFFSET) {
+            uint32_t desc_idx = (addr - EM_BT_RXDESC_OFFSET) / sizeof(em_bt_rxdesc_t);
+            uint32_t desc_off = (addr - EM_BT_RXDESC_OFFSET) % sizeof(em_bt_rxdesc_t);
+            if (desc_off == 0) {
+                em_bt_rxdesc_t *desc = (em_bt_rxdesc_t *)(em_ptr + EM_BT_RXDESC_OFFSET + desc_idx * sizeof(em_bt_rxdesc_t));
+                fprintf(stderr, "BT_RXDESC[%d] @ EM+0x%04x:\n", desc_idx, (uint32_t)(EM_BT_RXDESC_OFFSET + desc_idx * sizeof(em_bt_rxdesc_t)));
+                fprintf(stderr, "  rxstat=0x%04x bt_hdr=0x%04x acl_hdr=0x%04x data_ptr=0x%04x\n",
+                        desc->rxstat, desc->bt_header, desc->acl_header, desc->data_ptr);
+            }
+        } else if (addr >= EM_BT_TXDESC_OFFSET && addr < EM_BLE_RXDESC_OFFSET) {
+            uint32_t desc_idx = (addr - EM_BT_TXDESC_OFFSET) / sizeof(em_bt_txdesc_t);
+            uint32_t desc_off = (addr - EM_BT_TXDESC_OFFSET) % sizeof(em_bt_txdesc_t);
+            if (desc_off == 0) {
+                em_bt_txdesc_t *desc = (em_bt_txdesc_t *)(em_ptr + EM_BT_TXDESC_OFFSET + desc_idx * sizeof(em_bt_txdesc_t));
+                fprintf(stderr, "BT_TXDESC[%d] @ EM+0x%04x:\n", desc_idx, (uint32_t)(EM_BT_TXDESC_OFFSET + desc_idx * sizeof(em_bt_txdesc_t)));
+                fprintf(stderr, "  txctrl=0x%04x bt_hdr=0x%04x acl_hdr=0x%04x data_ptr=0x%04x\n",
+                        desc->txctrl, desc->bt_header, desc->acl_header, desc->txdataptr);
+            }
+        }
     }
     
     return val;
@@ -135,20 +158,23 @@ static void btdm_em_write(void *opaque, hwaddr addr, uint64_t val, unsigned size
     memcpy(em_ptr + addr, &val, size);
     
     if (btdm_em_debug_level >= 2) {
-        qemu_log("EM_WR [%s] 0x%04" HWADDR_PRIx " (%d) <- 0x%0*" PRIx64 "\n",
+        fprintf(stderr, "EM_WR [%s] 0x%04" HWADDR_PRIx " (%d) <- 0x%0*" PRIx64 "\n",
                  EM_REGION_NAME(addr), addr, size, size*2, val);
     }
     
     /* Log descriptor writes for debugging */
     if (btdm_em_debug_level >= 3) {
-        /* Check if this could be an RX descriptor (14-byte aligned regions) */
+        /* Check if this could be an RX descriptor */
         if (addr >= EM_BT_RXDESC_OFFSET && addr < EM_BT_TXDESC_OFFSET) {
-            uint32_t desc_offset = (addr - EM_BT_RXDESC_OFFSET) % 14;
-            if (desc_offset == 0 && size >= 2) {
-                qemu_log("  -> BT_RXDESC RXSTAT write\n");
-            }
+            uint32_t desc_idx = (addr - EM_BT_RXDESC_OFFSET) / sizeof(em_bt_rxdesc_t);
+            fprintf(stderr, "  -> BT_RXDESC[%d] write\n", desc_idx);
+        } else if (addr >= EM_BT_TXDESC_OFFSET && addr < EM_BLE_RXDESC_OFFSET) {
+            uint32_t desc_idx = (addr - EM_BT_TXDESC_OFFSET) / sizeof(em_bt_txdesc_t);
+            fprintf(stderr, "  -> BT_TXDESC[%d] write\n", desc_idx);
         } else if (addr >= EM_BLE_RXDESC_OFFSET && addr < EM_BLE_TXDESC_OFFSET) {
-            qemu_log("  -> BLE_RXDESC region write\n");
+            fprintf(stderr, "  -> BLE_RXDESC region write\n");
+        } else if (addr >= EM_BLE_TXDESC_OFFSET && addr < EM_BLE_CS_OFFSET) {
+            fprintf(stderr, "  -> BLE_TXDESC region write\n");
         }
     }
 }
