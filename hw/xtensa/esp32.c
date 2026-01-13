@@ -765,11 +765,11 @@ static void ble_timer_cb(void *opaque)
     
     cb_count++;
     
-    /* Warmup period: run timer but don't raise IRQ for first 100 ticks (~62.5ms) */
-    /* This ensures interrupt handlers are fully registered before we fire */
-    if (warmup_ticks < 100) {
+    /* Warmup period: run timer but don't raise IRQ for first 1000 ticks (~625ms) */
+    /* This ensures interrupt handlers AND PHY calibration are fully complete before we fire */
+    if (warmup_ticks < 1000) {
         warmup_ticks++;
-        if (warmup_ticks == 100) {
+        if (warmup_ticks == 1000) {
             fprintf(stderr, ">>> BLE Timer: Warmup complete, starting interrupt generation\n");
         }
         /* Reschedule without raising IRQ */
