@@ -393,6 +393,8 @@ static struct {
     uint32_t intstat;      /* 0x100: interrupt status */
     uint32_t intack;       /* 0x104: interrupt acknowledge */
     uint32_t intcntl;      /* 0x108: interrupt control/enable */
+    uint32_t blediagstat;  /* 0xa04: BLE diagnostic status (return 0 to prevent retry loops) */
+    uint32_t blediagcntl;  /* 0xa08: BLE diagnostic control */
     /* Storage for other LC registers (0x000-0x0FF, 0x10C-0xFFF) */
     uint8_t regs[0x1000];
 } bt_lc_state;
@@ -423,6 +425,12 @@ static uint64_t bt_lc_read(void *opaque, hwaddr addr, unsigned size)
     case 0x108:  /* BT_LC_INTCNTL */
         val = bt_lc_state.intcntl;
         break;
+    case 0xa04:  /* BLEDIAGSTAT - return 0 to prevent retry loops */
+        val = bt_lc_state.blediagstat;
+        break;
+    case 0xa08:  /* BLEDIAGCNTL */
+        val = bt_lc_state.blediagcntl;
+        break;
     default:
         /* For other offsets, return stored value from regs array */
         if (addr < 0x1000) {
@@ -448,6 +456,9 @@ static void bt_lc_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
         break;
     case 0x108:  /* BT_LC_INTCNTL */
         bt_lc_state.intcntl = val;
+        break;
+    case 0xa08:  /* BLEDIAGCNTL */
+        bt_lc_state.blediagcntl = val;
         break;
     default:
         /* Store to regs array for other offsets */
