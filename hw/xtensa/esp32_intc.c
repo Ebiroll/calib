@@ -20,12 +20,20 @@
 
 #define INTMATRIX_UNINT_VALUE   6
 
+/* Global flag: set when BT_BB interrupt (source 4) is mapped to a valid CPU interrupt */
+/* This is used by the BLE timer to know when ISR is registered and ready */
+int esp32_bt_bb_isr_registered = 0;
+
 #define IRQ_MAP(cpu, input) s->irq_map[cpu][input]
 
 static void esp32_intmatrix_irq_handler(void *opaque, int n, int level)
 {
     Esp32IntMatrixState *s = ESP32_INTMATRIX(opaque);
-//    printf("esp32_intmatrix_irq_handler %x %x\n",n,level);
+    /* Debug BT_BB interrupt (source 4) */
+    if (n == 4) {
+        fprintf(stderr, ">>> INTMATRIX: BT_BB (src=%d) level=%d, map[PRO]=%d, map[APP]=%d\n",
+                n, level, s->irq_map[0][n], s->irq_map[1][n]);
+    }
     s->irq_raw[n] = level;
     for (int i = 0; i < ESP32_CPU_COUNT; ++i) {
         if (s->outputs[i] == NULL) {
@@ -34,6 +42,10 @@ static void esp32_intmatrix_irq_handler(void *opaque, int n, int level)
         int out_index = IRQ_MAP(i, n);
         for (int int_index = 0; int_index < s->cpu[i]->env.config->nextint; ++int_index) {
             if (s->cpu[i]->env.config->extint[int_index] == out_index) {
+                if (n == 4) {
+                    fprintf(stderr, ">>> INTMATRIX: Routing BT_BB to CPU%d extint[%d]=%d\n",
+                            i, int_index, out_index);
+                }
                 qemu_set_irq(s->outputs[i][int_index], level);
                 break;
             }
@@ -65,6 +77,13 @@ static void esp32_intmatrix_write(void *opaque, hwaddr addr, uint64_t value,
     Esp32IntMatrixState *s = ESP32_INTMATRIX(opaque);
     int source_index = (addr / sizeof(uint32_t)) % ESP32_INT_MATRIX_INPUTS;
     uint8_t *map_entry = get_map_entry(s, addr);
+    
+    /* Detect when BT_BB (source 4) is mapped to a valid interrupt */
+    if (source_index == 4 && value != INTMATRIX_UNINT_VALUE && !esp32_bt_bb_isr_registered) {
+        fprintf(stderr, ">>> INTMATRIX: BT_BB ISR registered (mapped to int %d)\n", (int)value);
+        esp32_bt_bb_isr_registered = 1;
+    }
+    
     if (value == INTMATRIX_UNINT_VALUE) {
         int si = s->irq_raw[source_index];
         esp32_intmatrix_irq_handler(s, source_index, 0);

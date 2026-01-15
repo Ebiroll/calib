@@ -385,6 +385,89 @@ static struct {
     bool initialized;
 } btdm_state;
 
+/* BT Link Controller interrupt state (0x3ff51000 region)
+ * This handles the separate LC interrupt registers that the btdm_bb_isr reads.
+ * The ISR reads 0x3ff51100 (intstat) and writes 0x3ff51104 (intack).
+ */
+static struct {
+    uint32_t intstat;      /* 0x100: interrupt status */
+    uint32_t intack;       /* 0x104: interrupt acknowledge */
+    uint32_t intcntl;      /* 0x108: interrupt control/enable */
+    /* Storage for other LC registers (0x000-0x0FF, 0x10C-0xFFF) */
+    uint8_t regs[0x1000];
+} bt_lc_state;
+
+/* BT LC interrupt bits used by btdm_bb_isr */
+#define BT_LC_INT_PLL_TRACK1    (1 << 0)   /* 0x001 - PLL tracking */
+#define BT_LC_INT_PLL_TRACK2    (1 << 3)   /* 0x008 - PLL tracking alternate */
+#define BT_LC_INT_GPIO_1_0      (1 << 5)   /* 0x020 - GPIO set level (1,0) */
+#define BT_LC_INT_GPIO_1        (1 << 6)   /* 0x040 - GPIO set level (1) */
+#define BT_LC_INT_GPIO_0        (1 << 7)   /* 0x080 - GPIO set level (0) */
+#define BT_LC_INT_GPIO_0_1      (1 << 8)   /* 0x100 - GPIO/TX retry */
+#define BT_LC_INT_COEX          (1 << 18)  /* 0x40000 - BLE coexistence */
+
+static uint64_t bt_lc_read(void *opaque, hwaddr addr, unsigned size)
+{
+    uint32_t val = 0;
+    
+    switch (addr) {
+    case 0x100:  /* BT_LC_INTSTAT */
+        val = bt_lc_state.intstat;
+        if (val != 0) {
+            fprintf(stderr, ">>> BT_LC READ INTSTAT: 0x%x\n", val);
+        }
+        break;
+    case 0x104:  /* BT_LC_INTACK - read returns last ack value */
+        val = bt_lc_state.intack;
+        break;
+    case 0x108:  /* BT_LC_INTCNTL */
+        val = bt_lc_state.intcntl;
+        break;
+    default:
+        /* For other offsets, return stored value from regs array */
+        if (addr < 0x1000) {
+            memcpy(&val, &bt_lc_state.regs[addr], size > 4 ? 4 : size);
+        }
+        break;
+    }
+    
+    return val;
+}
+
+static void bt_lc_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
+{
+    switch (addr) {
+    case 0x100:  /* BT_LC_INTSTAT - usually read-only, but allow writes */
+        bt_lc_state.intstat = val;
+        break;
+    case 0x104:  /* BT_LC_INTACK - writing clears corresponding bits in INTSTAT */
+        fprintf(stderr, ">>> BT_LC INTACK: ack=0x%" PRIx64 ", was intstat=0x%x\n", 
+                val, bt_lc_state.intstat);
+        bt_lc_state.intack = val;
+        bt_lc_state.intstat &= ~val;  /* Clear acknowledged bits */
+        break;
+    case 0x108:  /* BT_LC_INTCNTL */
+        bt_lc_state.intcntl = val;
+        break;
+    default:
+        /* Store to regs array for other offsets */
+        if (addr < 0x1000) {
+            memcpy(&bt_lc_state.regs[addr], &val, size > 4 ? 4 : size);
+        }
+        break;
+    }
+}
+
+static const MemoryRegionOps bt_lc_ops = {
+    .read = bt_lc_read,
+    .write = bt_lc_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+};
+
 static void btdm_state_init(void)
 {
     if (btdm_state.initialized) {
@@ -759,11 +842,14 @@ static const MemoryRegionOps phy_mmio_ops = {
     },
 };
 
+/* External flag from esp32_intc.c - set when BT_BB ISR is registered */
+extern int esp32_bt_bb_isr_registered;
+
 /* BLE timer callback - generates periodic interrupts for the BLE scheduler */
 static void ble_timer_cb(void *opaque)
 {
     static int cb_count = 0;
-    static int warmup_ticks = 0;
+    static int isr_ready_logged = 0;
     static int irq_cooldown = 0;  /* Cooldown counter to avoid interrupt storm */
     
     if (!ble_timer_state.enabled) {
@@ -772,18 +858,22 @@ static void ble_timer_cb(void *opaque)
     
     cb_count++;
     
-    /* Warmup period: run timer but don't raise IRQ for first 10000 ticks (~6.25s) */
-    /* This ensures PHY calibration AND controller enable are complete before we fire */
-    /* PHY calibration can take several seconds in QEMU due to emulation overhead */
-    if (warmup_ticks < 10000) {
-        warmup_ticks++;
-        if (warmup_ticks == 10000) {
-            fprintf(stderr, ">>> BLE Timer: Warmup complete, starting interrupt generation\n");
-        }
-        /* Reschedule without raising IRQ */
+    /* Wait until the BT_BB ISR is actually registered in the interrupt matrix */
+    /* This prevents us from firing interrupts before the firmware is ready to handle them */
+    if (!esp32_bt_bb_isr_registered) {
+        /* ISR not yet registered, just reschedule */
         timer_mod(ble_timer_state.timer, 
                   qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + ble_timer_state.period_ns);
         return;
+    }
+    
+    /* Log once when ISR becomes ready */
+    if (!isr_ready_logged) {
+        fprintf(stderr, ">>> BLE Timer: ISR registered, starting interrupt generation (after %d ticks)\n", cb_count);
+        isr_ready_logged = 1;
+        /* Clear any stale interrupt state */
+        btdm_state.bleintstat = 0;
+        btdm_state.bleintrawstat = 0;
     }
 
     /* Increment the base time counter (simulates 625µs slots) */
@@ -808,22 +898,38 @@ static void ble_timer_cb(void *opaque)
         return;
     }
 
-    /* Set CSCNT interrupt bit to wake up scheduler */
-    btdm_state.bleintrawstat |= BLE_CSCNT_INTSTAT_BIT;
+    /* Generate interrupt bits that are actually ENABLED in intcntl (0x33a):
+     * Bit 1 (RXINT=0x2), Bit 3 (EVENTAPFAINT=0x8), Bit 4 (FINETGT=0x10),
+     * Bit 5 (GROSSTGT=0x20), Bit 8 (EVENTINT=0x100), Bit 9 (SWINT=0x200)
+     * Note: CSCNT (bit 0) and SLPINT (bit 2) are NOT enabled!
+     */
     
-    /* Also set FINETGTINT periodically (every 64 slots ~ 40ms) for timer target events */
-    if ((btdm_state.blebasetimecnt & 0x3F) == 0) {
-        btdm_state.bleintrawstat |= BLE_FINETGTINT_INTSTAT_BIT;
+    /* Also generate LC interrupts for btdm_bb_isr (0x3ff51100) */
+    /* Set PLL track interrupt periodically */
+    if ((btdm_state.blebasetimecnt & 0xF) == 0) {
+        bt_lc_state.intstat |= BT_LC_INT_PLL_TRACK1;
+    }
+    /* Set coex interrupt occasionally */
+    if ((btdm_state.blebasetimecnt & 0x7F) == 0) {
+        bt_lc_state.intstat |= BT_LC_INT_COEX;
     }
     
-    /* Set EVENTINT periodically (every 256 slots ~ 160ms) to complete advertising/scanning events */
-    if ((btdm_state.blebasetimecnt & 0xFF) == 0) {
+    /* Set FINETGTINT on every tick - this is the main scheduler interrupt */
+    btdm_state.bleintrawstat |= BLE_FINETGTINT_INTSTAT_BIT;
+    
+    /* Set GROSSTGTINT periodically (every 8 slots ~ 5ms) */
+    if ((btdm_state.blebasetimecnt & 0x7) == 0) {
+        btdm_state.bleintrawstat |= BLE_GROSSTGTINT_INTSTAT_BIT;
+    }
+    
+    /* Set EVENTINT periodically (every 64 slots ~ 40ms) to complete advertising/scanning events */
+    if ((btdm_state.blebasetimecnt & 0x3F) == 0) {
         btdm_state.bleintrawstat |= BLE_EVENTINT_INTSTAT_BIT;
     }
     
-    /* Set SLPINT rarely (every 512 slots ~ 320ms) for sleep wake-up */
-    if ((btdm_state.blebasetimecnt & 0x1FF) == 0) {
-        btdm_state.bleintrawstat |= BLE_SLPINT_INTSTAT_BIT;
+    /* Set EVENTAPFAINT occasionally (every 128 slots ~ 80ms) */
+    if ((btdm_state.blebasetimecnt & 0x7F) == 0) {
+        btdm_state.bleintrawstat |= BLE_EVENTAPFAINT_INTSTAT_BIT;
     }
     
     /* Check which enabled interrupts should fire */
@@ -1209,9 +1315,11 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
     memory_region_init_alias(rtcfast_d, NULL, "esp32.rtcfast_d", rtcfast_i, 0, memmap[ESP32_MEMREGION_RTCFAST_D].size);
     memory_region_add_subregion(&s->cpu_specific_mem[0], memmap[ESP32_MEMREGION_RTCFAST_D].base, rtcfast_d);
 
-    /* 1. Link Controller / BT RF registers (0x3ff51000) - RAM for RX filter init etc */
+    /* 1. Link Controller / BT RF registers (0x3ff51000) - MMIO for interrupt handling
+     * The btdm_bb_isr reads 0x3ff51100 (intstat) and writes 0x3ff51104 (intack).
+     */
     MemoryRegion *bt_lc_io = g_new(MemoryRegion, 1);
-    memory_region_init_ram(bt_lc_io, OBJECT(dev), "esp32.bt_lc", 0x1000, &error_fatal);
+    memory_region_init_io(bt_lc_io, OBJECT(dev), &bt_lc_ops, s, "esp32.bt_lc", 0x1000);
     memory_region_add_subregion(sys_mem, DR_REG_BT_BASE, bt_lc_io);
 
     /* 1b. BT RF/Modem registers (0x3ff5c000) - RAM for filter coefficients etc */
