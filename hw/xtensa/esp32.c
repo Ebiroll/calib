@@ -392,6 +392,8 @@ static struct {
     uint32_t blecoexifcntl0;    /* 0x300 */
     uint32_t bleralptr;         /* 0x320 */
     uint32_t bleralnbdev;       /* 0x324 */
+    /* Coexistence and status registers */
+    uint32_t bbif_coex_status;  /* BBIF coex status - bit 0=RX, bit 4=TX, bit 8=BLE_IN_PROCESS */
     /* RivieraWaves Interrupt Controller (offset 0x350+) */
     uint32_t rwintcntl;         /* 0x350 - RW interrupt control */
     uint32_t rwintstat;         /* 0x354 - RW interrupt status (returns IRQ number) */
@@ -438,8 +440,7 @@ static uint64_t bt_lc_read(void *opaque, hwaddr addr, unsigned size)
             uint64_t now_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
             /* BT clock ticks every 312.5us = 312500ns, 28-bit counter */
             val = (uint32_t)(now_ns / 312500ULL) & 0x0FFFFFFF;
-            /* Bit 31 = clock valid (must be set or firmware loops) */
-            val |= (1u << 31);
+            /* Bit 31 = 0 (not busy/ready) - firmware loops with bltz while set */
         }
         break;
     case 0x08:   /* BT_LC_FINECNT - Fine counter within slot (0-624us) */
@@ -667,7 +668,11 @@ static uint64_t phy_mmio_read(void *opaque, hwaddr addr, unsigned size)
     case 0x1B0: val = btdm_state.reg_1b0; break;
     case 0x1E0: val = btdm_state.reg_1e0; break;
     /* BLE Section (offset 0x200+) */
-    case 0x200: val = btdm_state.blecntl; break;
+    case 0x200:
+        /* BLECNTL - BLE control register
+         * Ensure BLE_IN_PROCESS (bit 8) is clear so r_rwip_sleep/r_rwip_init don't hang */
+        val = btdm_state.blecntl & ~(1u << 8);
+        break;
     case 0x204: val = btdm_state.bleversion; break;
     case 0x208: val = btdm_state.bleconf; break;
     case 0x20C: val = btdm_state.bleintcntl; break;
@@ -681,27 +686,34 @@ static uint64_t phy_mmio_read(void *opaque, hwaddr addr, unsigned size)
     case 0x218: val = btdm_state.bleintack; break;
     case 0x21C:
         /* BLEBASETIMECNT - 28-bit counter incrementing every 312.5us (half-slot)
-         * Bit 31 is "clock valid" - must be 1 or firmware loops forever
+         * Bit 31 is "Busy" flag - firmware loops with bltz while bit 31 is SET
+         * Must return bit 31 CLEAR (0) to indicate ready/not busy
          * Use real QEMU clock to compute value */
         {
             uint64_t now_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
             /* 312.5us = 312500ns per tick */
             uint32_t base_ticks = (uint32_t)(now_ns / 312500ULL) & 0x0FFFFFFF;
-            /* Bit 31 = clock valid (always set), bits 27:0 = counter */
-            val = (1u << 31) | base_ticks;
+            /* Bit 31 = 0 (not busy/ready), bits 27:0 = counter */
+            val = base_ticks;  /* Bit 31 clear = ready */
         }
         break;
     case 0x220:
-        /* BLEFINETIMECNT - 10-bit counter (0-624) within each 625us slot
-         * Increments every 1us, wraps at 625 */
-        {
-            uint64_t now_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-            /* Fine time is position within 625us slot (in microseconds) */
-            uint32_t fine_us = (uint32_t)((now_ns / 1000ULL) % 625ULL);
-            val = fine_us & 0x3FF;  /* 10-bit value */
-        }
+        /* BLEFINETIMECNT / BBIF_COEX_STATUS
+         * During normal operation: 10-bit fine time counter (0-624)
+         * During PHY init: Coex status register
+         *   Bit 0 = RX active
+         *   Bit 4 = TX active
+         *   Bit 8 = BLE_IN_PROCESS (baseband busy/power-up)
+         *   Bit 31 = status valid (clear = ready)
+         * Return 0 to indicate all idle, PHY ready, not in process */
+        val = 0;  /* All idle: no RX, no TX, not in process, ready */
         break;
-    case 0x224: val = btdm_state.blebdaddrl; break;
+    case 0x224:
+        /* BLEBDADDRL / PHY_STATUS2 - BD address low, also polled during PHY init
+         * Bit 8 = BLE_IN_PROCESS (must be 0 or r_rwip_sleep/r_rwip_init hang)
+         * Bit 31 clear = ready for bltz check */
+        val = btdm_state.blebdaddrl & ~((1u << 8) | (1u << 31));  /* Clear bits 8 and 31 */
+        break;
     case 0x228: val = btdm_state.blebdaddru; break;
     case 0x22C: val = btdm_state.blecurrentrxdescptr; break;
     /* Deep sleep registers - bit 31 always reads as 0 (not sleeping in emulation) */
