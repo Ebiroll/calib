@@ -128,12 +128,36 @@ static struct {
 /* Forward declarations for BLE timer functions */
 static void ble_timer_update(void);
 
+/* VHCI register offsets (from EM base 0x3ffb0000, so 0x7000 = 0x3ffb7000) */
+#define VHCI_OFFSET             0x7000
+#define VHCI_HOST_READY         0x7000  /* Host ready status */
+#define VHCI_CTRL_STATUS        0x7004  /* Controller status */
+
+/* Controller status offset (0x3ffbf3fc = EM base + 0xf3fc) */
+#define BTDM_CTRL_STATUS_OFFSET 0xf3fc
+
 /* Intercepts the Data Plane (Exchange Memory) */
 static uint64_t btdm_em_read(void *opaque, hwaddr addr, unsigned size) {
-    uint8_t *em_ptr = (uint8_t *)opaque; 
+    uint8_t *em_ptr = (uint8_t *)opaque;
     uint32_t val = 0;
     memcpy(&val, em_ptr + addr, size);
-    
+
+    /* VHCI register reads - return host ready status */
+    if (addr >= VHCI_OFFSET && addr < VHCI_OFFSET + 0x100) {
+        if (addr == VHCI_HOST_READY) {
+            /* Return host ready = 1 */
+            val = 1;
+            fprintf(stderr, ">>> VHCI read HOST_READY: returning 1\n");
+        }
+    }
+
+    /* Controller status read at 0x3ffbf3fc - return 0 to indicate controller enabled */
+    if (addr == BTDM_CTRL_STATUS_OFFSET) {
+        /* Return 0 to indicate btdm_controller_enable succeeded */
+        val = 0;
+        fprintf(stderr, ">>> BTDM controller status read: returning 0 (enabled)\n");
+    }
+
     if (btdm_em_debug_level >= 2) {
         fprintf(stderr, "EM_RD [%s] 0x%04" HWADDR_PRIx " (%d) -> 0x%0*x%s\n",
                  EM_REGION_NAME(addr), addr, size, size*2, val, em_field_comment(addr, val));
@@ -141,7 +165,7 @@ static uint64_t btdm_em_read(void *opaque, hwaddr addr, unsigned size) {
         /* Always log NVDS magic reads */
         fprintf(stderr, "EM_RD NVDS 0x%04" HWADDR_PRIx " -> 0x%08x\n", addr, val);
     }
-    
+
     /* Print descriptor details when reading from descriptor areas */
     if (btdm_em_debug_level >= 3) {
         if (addr >= EM_BT_RXDESC_OFFSET && addr < EM_BT_TXDESC_OFFSET) {
@@ -154,7 +178,7 @@ static uint64_t btdm_em_read(void *opaque, hwaddr addr, unsigned size) {
             fprintf(stderr, "BT_TXDESC[%d] read @ EM+0x%04" HWADDR_PRIx "\n", desc_idx, addr);
         }
     }
-    
+
     return val;
 }
 
@@ -163,8 +187,26 @@ static void btdm_em_write(void *opaque, hwaddr addr, uint64_t val, unsigned size
     static bool ble_timer_force_started = false;
     static bool osi_table_written = false;
     static int ble_cs_write_count = 0;
-    
+
     memcpy(em_ptr + addr, &val, size);
+
+    /* VHCI register writes - signal host ready when CPU writes here */
+    if (addr >= VHCI_OFFSET && addr < VHCI_OFFSET + 0x100) {
+        fprintf(stderr, ">>> VHCI write: offset 0x%04" HWADDR_PRIx " <- 0x%" PRIx64 "\n", addr, val);
+        /* When CPU writes to VHCI, set host ready status */
+        em_ptr[VHCI_HOST_READY] = 1;  /* Host is ready */
+        em_ptr[VHCI_HOST_READY + 1] = 0;
+        em_ptr[VHCI_HOST_READY + 2] = 0;
+        em_ptr[VHCI_HOST_READY + 3] = 0;
+    }
+
+    /* Monitor controller status writes at 0x3ffbf3fc */
+    if (addr == BTDM_CTRL_STATUS_OFFSET ||
+        (addr <= BTDM_CTRL_STATUS_OFFSET && addr + size > BTDM_CTRL_STATUS_OFFSET)) {
+        uint32_t status = 0;
+        memcpy(&status, em_ptr + BTDM_CTRL_STATUS_OFFSET, 4);
+        fprintf(stderr, ">>> BTDM controller status write: 0x%x (addr 0x%04" HWADDR_PRIx ")\n", status, addr);
+    }
     
     /* Detect when OSI table is fully written (last entry at 0x2A50) */
     if (!osi_table_written && addr >= 0x2A50 && addr < 0x2A60) {
@@ -394,6 +436,9 @@ static struct {
     uint32_t bleralnbdev;       /* 0x324 */
     /* Coexistence and status registers */
     uint32_t bbif_coex_status;  /* BBIF coex status - bit 0=RX, bit 4=TX, bit 8=BLE_IN_PROCESS */
+    /* Sleep/PMU status registers */
+    uint32_t bt_sleep_status;   /* 0x048 - Sleep status, bit 15=sleep transition complete */
+    uint32_t pmu_ctrl;          /* 0x100 - PMU control register */
     /* RivieraWaves Interrupt Controller (offset 0x350+) */
     uint32_t rwintcntl;         /* 0x350 - RW interrupt control */
     uint32_t rwintstat;         /* 0x354 - RW interrupt status (returns IRQ number) */
@@ -647,6 +692,12 @@ static uint64_t phy_mmio_read(void *opaque, hwaddr addr, unsigned size)
     case 0x03C: val = btdm_state.reg_03c; break;
     case 0x040: val = btdm_state.reg_040; break;
     case 0x044: val = btdm_state.reg_044; break;
+    case 0x048:
+        /* BT_SLEEP_STATUS - Sleep/wake transition status
+         * Bit 15 must be 1 to signal sleep transition complete
+         * Always return bit 15 set to indicate ready */
+        val = btdm_state.bt_sleep_status | (1u << 15);
+        break;
     case 0x050: val = btdm_state.reg_050; break;
     case 0x060: val = btdm_state.reg_060; break;
     case 0x064: val = btdm_state.reg_064; break;
@@ -655,6 +706,11 @@ static uint64_t phy_mmio_read(void *opaque, hwaddr addr, unsigned size)
     case 0x080: val = btdm_state.reg_080; break;
     case 0x098: val = btdm_state.reg_098; break;
     case 0x0A4: val = btdm_state.reg_0a4; break;
+    case 0x100:
+        /* PMU_CTRL - Power Management Unit control
+         * Return with 'Active' bits cleared to indicate sleep mode ready */
+        val = btdm_state.pmu_ctrl & ~0xFF;  /* Clear active bits in low byte */
+        break;
     case 0x0B0: val = btdm_state.reg_0b0; break;
     case 0x0B4: val = btdm_state.reg_0b4; break;
     case 0x0BC: val = btdm_state.reg_0bc; break;
@@ -809,6 +865,10 @@ static void phy_mmio_write(void *opaque, hwaddr addr, uint64_t val, unsigned siz
     case 0x03C: btdm_state.reg_03c = val; break;
     case 0x040: btdm_state.reg_040 = val; break;
     case 0x044: btdm_state.reg_044 = val; break;
+    case 0x048:
+        /* BT_SLEEP_STATUS - write to control sleep state */
+        btdm_state.bt_sleep_status = val;
+        break;
     case 0x050: btdm_state.reg_050 = val; break;
     case 0x060: btdm_state.reg_060 = val; break;
     case 0x064: btdm_state.reg_064 = val; break;
@@ -817,6 +877,14 @@ static void phy_mmio_write(void *opaque, hwaddr addr, uint64_t val, unsigned siz
     case 0x080: btdm_state.reg_080 = val; break;
     case 0x098: btdm_state.reg_098 = val; break;
     case 0x0A4: btdm_state.reg_0a4 = val; break;
+    case 0x100:
+        /* PMU_CTRL - Power Management Unit control
+         * When CPU writes here, simulate hardware completing sleep transition:
+         * - Clear 'Active' bits in PMU_CTRL
+         * - Set 'Sleep complete' bit (bit 15) in BT_SLEEP_STATUS */
+        btdm_state.pmu_ctrl = val & ~0xFF;  /* Clear active bits immediately */
+        btdm_state.bt_sleep_status |= (1u << 15);  /* Set sleep transition complete */
+        break;
     case 0x0B0: btdm_state.reg_0b0 = val; break;
     case 0x0B4: btdm_state.reg_0b4 = val; break;
     case 0x0BC: btdm_state.reg_0bc = val; break;
@@ -1025,15 +1093,18 @@ static void ble_timer_cb(void *opaque)
         btdm_state.bleintstat |= pending;
         /* Clear rawstat bits that we're now asserting */
         btdm_state.bleintrawstat &= ~pending;
-        if (ble_timer_state.irq) {
-            fprintf(stderr, ">>> BLE IRQ: pulsing interrupt, pending=0x%x, intcntl=0x%x\n",
-                    pending, btdm_state.bleintcntl);
-            /* Pulse the IRQ (raise then immediately lower) */
-            qemu_set_irq(ble_timer_state.irq, 1);
-            qemu_set_irq(ble_timer_state.irq, 0);
-            /* Set cooldown - wait 16 ticks (~10ms) before considering another IRQ */
-            irq_cooldown = 16;
-        }
+    }
+
+    /* Only pulse BT_BB interrupt if there are actual pending interrupts
+     * in either BLE intstat OR BT_LC intstat - prevents phantom interrupts */
+    if (ble_timer_state.irq && (btdm_state.bleintstat != 0 || bt_lc_state.intstat != 0)) {
+        fprintf(stderr, ">>> BLE IRQ: pulsing interrupt, ble_intstat=0x%x, lc_intstat=0x%x\n",
+                btdm_state.bleintstat, bt_lc_state.intstat);
+        /* Pulse the IRQ (raise then immediately lower) */
+        qemu_set_irq(ble_timer_state.irq, 1);
+        qemu_set_irq(ble_timer_state.irq, 0);
+        /* Set cooldown - wait 16 ticks (~10ms) before considering another IRQ */
+        irq_cooldown = 16;
     }
     
     /* Debug: log every 1000 callbacks (~625ms) */
