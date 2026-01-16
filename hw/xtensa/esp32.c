@@ -117,6 +117,14 @@ static struct {
     uint64_t period_ns;
 } ble_timer_state;
 
+/* TX completion timer state - simulates hardware TX latency */
+static struct {
+    QEMUTimer *timer;           /* QEMU timer for delayed completion */
+    uint8_t *em_storage;        /* Pointer to Exchange Memory storage */
+    hwaddr desc_addr;           /* Address of pending TX descriptor */
+    bool pending;               /* TX completion is pending */
+} tx_completion_state;
+
 /* Forward declarations for BLE timer functions */
 static void ble_timer_update(void);
 
@@ -199,9 +207,19 @@ static void btdm_em_write(void *opaque, hwaddr addr, uint64_t val, unsigned size
         }
         fprintf(stderr, "EM_WR [BT_TXDESC%d.%s] 0x%04" HWADDR_PRIx " <- 0x%0*" PRIx64 "\n",
                 desc_idx, field_name, addr, size*2, val);
-        /* If TXCTRL write with bit 15 cleared, TX is being triggered */
-        if (field_off == 0x00 && size >= 2 && (val & 0x8000) == 0 && val != 0) {
-            fprintf(stderr, "  >>> TX TRIGGERED! (tx_ready cleared)\n");
+        /* Detect TX descriptor Ready bit being SET (0x8000) - schedule completion */
+        if (field_off == 0x00 && size >= 2) {
+            if (val == 0x8000) {
+                /* TX Ready - schedule completion after 625us (one BT slot) */
+                uint32_t desc_addr = EM_BASE_ADDR + addr;
+                tx_completion_state.desc_addr = desc_addr;
+                tx_completion_state.pending = true;
+                timer_mod(tx_completion_state.timer,
+                          qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 625 * 1000);
+                fprintf(stderr, "  >>> TX SCHEDULED: desc=0x%08x, completion in 625us\n", desc_addr);
+            } else if ((val & 0x8000) == 0 && val != 0) {
+                fprintf(stderr, "  >>> TX TRIGGERED! (tx_ready cleared)\n");
+            }
         }
     }
     /* Log RX descriptor writes (only non-zero) */
@@ -411,8 +429,26 @@ static struct {
 static uint64_t bt_lc_read(void *opaque, hwaddr addr, unsigned size)
 {
     uint32_t val = 0;
-    
+
     switch (addr) {
+    /* BT LC Timer registers - provide real-time clock values */
+    case 0x00:   /* BT_LC_CLKN - Native clock (312.5us ticks) */
+    case 0x04:   /* BT_LC_CLKN_ALT - Alternate clock read */
+        {
+            uint64_t now_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+            /* BT clock ticks every 312.5us = 312500ns, 28-bit counter */
+            val = (uint32_t)(now_ns / 312500ULL) & 0x0FFFFFFF;
+            /* Bit 31 = clock valid (must be set or firmware loops) */
+            val |= (1u << 31);
+        }
+        break;
+    case 0x08:   /* BT_LC_FINECNT - Fine counter within slot (0-624us) */
+        {
+            uint64_t now_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+            /* Fine time is position within 625us slot */
+            val = (uint32_t)((now_ns / 1000ULL) % 625ULL) & 0x3FF;
+        }
+        break;
     case 0x100:  /* BT_LC_INTSTAT */
         val = bt_lc_state.intstat;
         if (val != 0) {
@@ -438,7 +474,7 @@ static uint64_t bt_lc_read(void *opaque, hwaddr addr, unsigned size)
         }
         break;
     }
-    
+
     return val;
 }
 
@@ -449,10 +485,14 @@ static void bt_lc_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
         bt_lc_state.intstat = val;
         break;
     case 0x104:  /* BT_LC_INTACK - writing clears corresponding bits in INTSTAT */
-        fprintf(stderr, ">>> BT_LC INTACK: ack=0x%" PRIx64 ", was intstat=0x%x\n", 
+        fprintf(stderr, ">>> BT_LC INTACK: ack=0x%" PRIx64 ", was intstat=0x%x\n",
                 val, bt_lc_state.intstat);
         bt_lc_state.intack = val;
         bt_lc_state.intstat &= ~val;  /* Clear acknowledged bits */
+        /* Lower IRQ if no more interrupts pending */
+        if (ble_timer_state.irq && bt_lc_state.intstat == 0) {
+            qemu_irq_lower(ble_timer_state.irq);
+        }
         break;
     case 0x108:  /* BT_LC_INTCNTL */
         bt_lc_state.intcntl = val;
@@ -587,9 +627,16 @@ static uint64_t phy_mmio_read(void *opaque, hwaddr addr, unsigned size)
     case 0x014: val = btdm_state.btintrawstat; break;
     case 0x018: val = btdm_state.btintack; break;
     case 0x01C:
-        /* Clock latch register - return latched clock value with bit 31 cleared */
-        btdm_clock_counter += 312;  /* Simulate time passing (~312.5us per BT slot) */
-        val = btdm_state.clk_latch & 0x0FFFFFFF;  /* Bit 31 always reads as 0 (sample complete) */
+        /* BT Clock latch register - 28-bit Bluetooth clock (312.5us ticks)
+         * Bit 31 = sample request (write 1 to latch, reads as 0 when complete)
+         * Use real QEMU clock for accurate timing */
+        {
+            uint64_t now_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+            /* BT clock ticks every 312.5us = 312500ns */
+            uint32_t bt_clock = (uint32_t)(now_ns / 312500ULL) & 0x0FFFFFFF;
+            /* Bit 31 always reads as 0 (sample complete) */
+            val = bt_clock;
+        }
         break;
     case 0x028: val = btdm_state.reg_028; break;
     case 0x02C: val = btdm_state.reg_02c; break;
@@ -633,10 +680,27 @@ static uint64_t phy_mmio_read(void *opaque, hwaddr addr, unsigned size)
     case 0x214: val = btdm_state.bleintrawstat; break;
     case 0x218: val = btdm_state.bleintack; break;
     case 0x21C:
-        /* BLEBASETIMECNT - bit 31 auto-clears to indicate operation complete */
-        val = btdm_state.blebasetimecnt & 0x7FFFFFFF;
+        /* BLEBASETIMECNT - 28-bit counter incrementing every 312.5us (half-slot)
+         * Bit 31 is "clock valid" - must be 1 or firmware loops forever
+         * Use real QEMU clock to compute value */
+        {
+            uint64_t now_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+            /* 312.5us = 312500ns per tick */
+            uint32_t base_ticks = (uint32_t)(now_ns / 312500ULL) & 0x0FFFFFFF;
+            /* Bit 31 = clock valid (always set), bits 27:0 = counter */
+            val = (1u << 31) | base_ticks;
+        }
         break;
-    case 0x220: val = btdm_state.blefinetimecnt; break;
+    case 0x220:
+        /* BLEFINETIMECNT - 10-bit counter (0-624) within each 625us slot
+         * Increments every 1us, wraps at 625 */
+        {
+            uint64_t now_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+            /* Fine time is position within 625us slot (in microseconds) */
+            uint32_t fine_us = (uint32_t)((now_ns / 1000ULL) % 625ULL);
+            val = fine_us & 0x3FF;  /* 10-bit value */
+        }
+        break;
     case 0x224: val = btdm_state.blebdaddrl; break;
     case 0x228: val = btdm_state.blebdaddru; break;
     case 0x22C: val = btdm_state.blecurrentrxdescptr; break;
@@ -950,9 +1014,11 @@ static void ble_timer_cb(void *opaque)
         /* Clear rawstat bits that we're now asserting */
         btdm_state.bleintrawstat &= ~pending;
         if (ble_timer_state.irq) {
-            fprintf(stderr, ">>> BLE IRQ: raising interrupt, pending=0x%x, intcntl=0x%x\n",
+            fprintf(stderr, ">>> BLE IRQ: pulsing interrupt, pending=0x%x, intcntl=0x%x\n",
                     pending, btdm_state.bleintcntl);
-            qemu_irq_raise(ble_timer_state.irq);
+            /* Pulse the IRQ (raise then immediately lower) */
+            qemu_set_irq(ble_timer_state.irq, 1);
+            qemu_set_irq(ble_timer_state.irq, 0);
             /* Set cooldown - wait 16 ticks (~10ms) before considering another IRQ */
             irq_cooldown = 16;
         }
@@ -999,10 +1065,36 @@ static void ble_timer_update(void)
     }
 }
 
+/* TX completion callback - simulates hardware TX completion after 625us */
+static void tx_completion_cb(void *opaque)
+{
+    if (!tx_completion_state.pending) {
+        return;
+    }
+
+    /* Mark TX as done - clear txctrl (offset 0x00 from descriptor) */
+    hwaddr desc_offset = tx_completion_state.desc_addr - EM_BASE_ADDR;
+    tx_completion_state.em_storage[desc_offset] = 0x00;
+    tx_completion_state.em_storage[desc_offset + 1] = 0x00;
+
+    /* Set bit 0x10 in BT_LC INTSTAT */
+    bt_lc_state.intstat |= 0x10;
+
+    /* Pulse BT_BB interrupt (raise then immediately lower) */
+    if (ble_timer_state.irq) {
+        fprintf(stderr, ">>> TX COMPLETE: desc=0x%08x, pulsing BT_BB IRQ, intstat=0x%x\n",
+                (uint32_t)(EM_BASE_ADDR + desc_offset), bt_lc_state.intstat);
+        qemu_set_irq(ble_timer_state.irq, 1);
+        qemu_set_irq(ble_timer_state.irq, 0);
+    }
+
+    tx_completion_state.pending = false;
+}
+
 /* Force-start BLE timer when ROM bypasses register writes */
 static void ble_force_start_timer(void)
 {
-    fprintf(stderr, ">>> ble_force_start_timer: timer=%p, blecntl=0x%x\n", 
+    fprintf(stderr, ">>> ble_force_start_timer: timer=%p, blecntl=0x%x\n",
             (void*)ble_timer_state.timer, btdm_state.blecntl);
     btdm_state_init();
     btdm_state.blecntl |= 0x1;  /* Set RWBLE_EN */
@@ -1378,9 +1470,15 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
     {
         qemu_irq bt_bb_irq = qdev_get_gpio_in(DEVICE(&s->intmatrix), ETS_BT_BB_INTR_SOURCE);
         ble_timer_init(bt_bb_irq);
-        qemu_log("BLE Timer initialized (IRQ connected to BT_BB_INTR_SOURCE=%d)\n", 
+        qemu_log("BLE Timer initialized (IRQ connected to BT_BB_INTR_SOURCE=%d)\n",
                  ETS_BT_BB_INTR_SOURCE);
     }
+
+    /* Initialize TX completion timer */
+    tx_completion_state.timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, tx_completion_cb, NULL);
+    tx_completion_state.em_storage = em_storage;
+    tx_completion_state.pending = false;
+    qemu_log("TX Completion Timer initialized (EM storage=%p)\n", (void*)em_storage);
 
     for (int i = 0; i < ms->smp.cpus; ++i) {
         qdev_realize(DEVICE(&s->cpu[i]), NULL, &error_fatal);

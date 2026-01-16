@@ -94,17 +94,18 @@ typedef union {
     };
 } em_bt_rxctrl_t;
 
+
 /*
- * Complete RX Descriptor (14 bytes)
+ * Complete RX Descriptor (custom layout, 14 bytes)
  */
 typedef struct __attribute__((packed)) {
-    uint16_t rxstat;       /* 0x00: RX status / flags */
-    uint16_t bt_header;    /* 0x02: BT header (LT_ADDR, TYPE, FLOW, ARQN, SEQN, HEC) */
-    uint16_t acl_header;   /* 0x04: ACL header (LLID, FLOW, LENGTH) */
-    uint16_t data_ptr;     /* 0x06: EM offset to payload */
-    uint16_t crc;          /* 0x08: CRC / HEC / error flags */
-    uint16_t rssi_ch;      /* 0x0A: RSSI + channel */
-    uint16_t rxctrl;       /* 0x0C: RX control flags */
+    uint16_t next_ptr;    /* 0x00: EM offset to next desc (0x2390) */
+    uint16_t rxstat;      /* 0x02: HW status (Bit 15 = DONE) */
+    uint16_t bt_header;   /* 0x04: LT_ADDR, Packet Type, etc. */
+    uint16_t acl_header;  /* 0x06: LLID and Payload Length */
+    uint16_t reserved;    /* 0x08: Gap/Padding */
+    uint16_t data_ptr;    /* 0x0A: EM offset to payload (0x274c) */
+    uint16_t rfstat_ptr;  /* 0x0C: EM offset to RSSI/Channel info (0x2478) */
 } em_bt_rxdesc_t;
 
 _Static_assert(sizeof(em_bt_rxdesc_t) == 14, "RX descriptor must be 14 bytes");
@@ -588,14 +589,13 @@ static inline const char *acl_llid_name(uint8_t llid)
 /* Debug print helper for RX descriptor */
 static inline void em_bt_rxdesc_print(const em_bt_rxdesc_t *desc, uint32_t addr)
 {
-#if 1  
+#if 1
     em_bt_rxstat_t stat = { .val = desc->rxstat };
     em_bt_header_t hdr = { .raw = desc->bt_header };
     em_acl_header_t acl = { .raw = desc->acl_header };
-    em_bt_rssi_ch_t rssi = { .val = desc->rssi_ch };
-    em_bt_rxctrl_t ctrl = { .val = desc->rxctrl };
-    
+
     qemu_log("BT_RXDESC @ 0x%08x:\n", addr);
+    qemu_log("  NEXT_PTR: 0x%04x\n", desc->next_ptr);
     qemu_log("  RXSTAT: 0x%04x (valid=%d crc_err=%d hec_err=%d)\n",
              stat.val, stat.pkt_valid, stat.crc_err, stat.hec_err);
     qemu_log("  BT_HDR: 0x%04x (lt=%d type=%s flow=%d arqn=%d seqn=%d)\n",
@@ -605,9 +605,8 @@ static inline void em_bt_rxdesc_print(const em_bt_rxdesc_t *desc, uint32_t addr)
              acl.raw, acl_llid_name(acl.llid), acl.flow, acl.length);
     qemu_log("  DATA_PTR: 0x%04x -> 0x%08x\n",
              desc->data_ptr, EM_BASE_ADDR + (desc->data_ptr & 0x1FFF));
-    qemu_log("  RSSI: %d dBm, CH: %d\n", (int8_t)rssi.rssi, rssi.channel);
-    qemu_log("  RXCTRL: 0x%04x (enc=%d mic=%d edr=%d fhs=%d)\n",
-             ctrl.val, ctrl.encrypted, ctrl.mic_ok, ctrl.is_edr, ctrl.is_fhs);
+    qemu_log("  RFSTAT_PTR: 0x%04x -> 0x%08x\n",
+             desc->rfstat_ptr, EM_BASE_ADDR + (desc->rfstat_ptr & 0x1FFF));
 #endif
     (void)desc; (void)addr;  /* Suppress unused warnings */
 }
