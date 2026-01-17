@@ -24,15 +24,21 @@
 /* This is used by the BLE timer to know when ISR is registered and ready */
 int esp32_bt_bb_isr_registered = 0;
 
+/* Global flag: tracks when BT_BB ISR is currently executing (level=1 -> level=0 transition) */
+/* This helps prevent firing new interrupts while ISR is still processing */
+int esp32_bt_bb_isr_active = 0;
+
 #define IRQ_MAP(cpu, input) s->irq_map[cpu][input]
 
 static void esp32_intmatrix_irq_handler(void *opaque, int n, int level)
 {
     Esp32IntMatrixState *s = ESP32_INTMATRIX(opaque);
-    /* Debug BT_BB interrupt (source 4) */
+    /* Debug BT_BB interrupt (source 4) and track active state */
     if (n == 4) {
         fprintf(stderr, ">>> INTMATRIX: BT_BB (src=%d) level=%d, map[PRO]=%d, map[APP]=%d\n",
                 n, level, s->irq_map[0][n], s->irq_map[1][n]);
+        /* Track when BT_BB ISR is active - set on level=1, clear on level=0 */
+        esp32_bt_bb_isr_active = level;
     }
     s->irq_raw[n] = level;
     for (int i = 0; i < ESP32_CPU_COUNT; ++i) {

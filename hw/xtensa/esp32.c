@@ -108,6 +108,7 @@ static int btdm_em_debug_level = 1;
 /* Forward declarations */
 static void btdm_state_init(void);
 static void ble_force_start_timer(void);
+static void deep_sleep_wakeup_cb(void *opaque);
 
 /* BLE timer state */
 static struct {
@@ -124,6 +125,13 @@ static struct {
     hwaddr desc_addr;           /* Address of pending TX descriptor */
     bool pending;               /* TX completion is pending */
 } tx_completion_state;
+
+/* Deep sleep timer state - handles BB_DEEPSLCNTL wakeup */
+static struct {
+    QEMUTimer *timer;           /* QEMU timer for sleep duration */
+    bool sleeping;              /* True if in deep sleep mode */
+    uint32_t duration_slots;    /* Sleep duration in slots */
+} deep_sleep_state;
 
 /* Forward declarations for BLE timer functions */
 static void ble_timer_update(void);
@@ -609,7 +617,8 @@ static void btdm_state_init(void)
     /* Initialize BLE section with values from real hardware */
     btdm_state.blecntl = 0x000003e0;
     btdm_state.bleversion = 0x08000900;  /* TYP=8, REL=0, UPG=9, BUILD=0 */
-    btdm_state.bleconf = 0x00000000;
+    /* BLECONF: Bit31=DualMode, Bit21=Coex, Bits13:8=Freq(0x28=40MHz) */
+    btdm_state.bleconf = (1u << 31) | (1u << 21) | (0x28 << 8);
     btdm_state.bleintcntl = 0x00000000;
     btdm_state.bleintstat = 0x00000000;
     btdm_state.bleintrawstat = 0x00000001;
@@ -730,7 +739,16 @@ static uint64_t phy_mmio_read(void *opaque, hwaddr addr, unsigned size)
         val = btdm_state.blecntl & ~(1u << 8);
         break;
     case 0x204: val = btdm_state.bleversion; break;
-    case 0x208: val = btdm_state.bleconf; break;
+    case 0x208:
+        /* BLECONF - Hardware configuration register
+         * Bit 31: Dual Mode support (BLE + BR/EDR)
+         * Bit 21: Coexistence support (WiFi/BT coex)
+         * Bits 13:8: Frequency config (0x28 = 40MHz crystal)
+         * This tells btdm_controller_init about hardware capabilities */
+        val = (1u << 31) |      /* Dual Mode support */
+              (1u << 21) |      /* Coexistence support */
+              (0x28 << 8);      /* 40MHz frequency */
+        break;
     case 0x20C: val = btdm_state.bleintcntl; break;
     case 0x210: 
         val = btdm_state.bleintstat;
@@ -938,11 +956,34 @@ static void phy_mmio_write(void *opaque, hwaddr addr, uint64_t val, unsigned siz
     case 0x224: btdm_state.blebdaddrl = val; break;
     case 0x228: btdm_state.blebdaddru = val; break;
     case 0x22C: btdm_state.blecurrentrxdescptr = val; break;
-    /* Deep sleep registers - auto-clear bit 31 on write */
-    case 0x230: 
-        btdm_state.bledeepcntl = val & ~(1u << 31);
-        if (val & (1 << 31)) {
-            qemu_log("BTDM: Deep sleep requested but ignored in emulation\n");
+    /* BB_DEEPSLCNTL (0x230) - Deep sleep control
+     * Bit 31: Deep sleep enable - when set, start sleep timer
+     * When timer expires, set SLPINT (bit 2) and pulse IRQ */
+    case 0x230:
+        btdm_state.bledeepcntl = val;
+        if (val & (1u << 31)) {
+            /* Deep sleep requested - get duration from bleslpdur (0x234) */
+            uint32_t duration_slots = btdm_state.bleslpdur & 0x7FFFFFFF;
+            if (duration_slots == 0) {
+                duration_slots = 1;  /* Minimum 1 slot */
+            }
+            /* Each slot is 625us */
+            uint64_t duration_ns = (uint64_t)duration_slots * 625 * 1000;
+
+            deep_sleep_state.sleeping = true;
+            deep_sleep_state.duration_slots = duration_slots;
+
+            /* Set bit 15 in bt_sleep_status to indicate sleeping */
+            btdm_state.bt_sleep_status |= (1u << 15);
+
+            fprintf(stderr, ">>> DEEP SLEEP: Starting sleep for %u slots (%llu us)\n",
+                    duration_slots, (unsigned long long)(duration_ns / 1000));
+
+            /* Schedule wakeup timer */
+            if (deep_sleep_state.timer) {
+                timer_mod(deep_sleep_state.timer,
+                          qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + duration_ns);
+            }
         }
         break;
     case 0x234: btdm_state.bleslpdur = val; break;
@@ -1124,11 +1165,15 @@ static void ble_timer_init(qemu_irq irq)
     if (ble_timer_state.timer) {
         return;  /* Already initialized */
     }
-    
+
     ble_timer_state.irq = irq;
     ble_timer_state.period_ns = 625 * 1000;  /* 625µs = BLE slot time */
     ble_timer_state.timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, ble_timer_cb, NULL);
     ble_timer_state.enabled = false;
+
+    /* Also initialize the deep sleep wakeup timer */
+    deep_sleep_state.timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, deep_sleep_wakeup_cb, NULL);
+    deep_sleep_state.sleeping = false;
 }
 
 /* Start/stop BLE timer based on BLECNTL register */
@@ -1175,6 +1220,43 @@ static void tx_completion_cb(void *opaque)
 }
 
 /* Force-start BLE timer when ROM bypasses register writes */
+/* Deep sleep wakeup callback - fires when BB_DEEPSLCNTL timer expires */
+static void deep_sleep_wakeup_cb(void *opaque)
+{
+    if (!deep_sleep_state.sleeping) {
+        return;
+    }
+
+    fprintf(stderr, ">>> DEEP SLEEP WAKEUP: duration was %u slots\n",
+            deep_sleep_state.duration_slots);
+
+    /* Mark as awake */
+    deep_sleep_state.sleeping = false;
+
+    /* Clear bit 15 in BB_DEEPSLSTAT (0x048) to signal controller is now awake */
+    btdm_state.bt_sleep_status &= ~(1u << 15);
+
+    /* Clear deep sleep active bit (bit 31) in bledeepcntl */
+    btdm_state.bledeepcntl &= ~(1u << 31);
+
+    /* Set Bit 2 (SLPINT - End of Sleep interrupt) in BTINTSTAT (0x010) */
+    btdm_state.btintstat |= BLE_SLPINT_INTSTAT_BIT;
+
+    /* Also set in BLE intstat for BLE sleep wakeup */
+    btdm_state.bleintstat |= BLE_SLPINT_INTSTAT_BIT;
+
+    /* Pulse the BT_BB IRQ if interrupt is enabled */
+    uint32_t bt_enabled = btdm_state.btintstat & btdm_state.btintcntl;
+    uint32_t ble_enabled = btdm_state.bleintstat & btdm_state.bleintcntl;
+
+    if (ble_timer_state.irq && (bt_enabled != 0 || ble_enabled != 0)) {
+        fprintf(stderr, ">>> DEEP SLEEP WAKEUP: Pulsing BT_BB IRQ (btintstat=0x%x, bleintstat=0x%x)\n",
+                btdm_state.btintstat, btdm_state.bleintstat);
+        qemu_set_irq(ble_timer_state.irq, 1);
+        qemu_set_irq(ble_timer_state.irq, 0);
+    }
+}
+
 static void ble_force_start_timer(void)
 {
     fprintf(stderr, ">>> ble_force_start_timer: timer=%p, blecntl=0x%x\n",
