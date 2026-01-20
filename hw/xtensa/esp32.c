@@ -160,8 +160,21 @@ static void ble_timer_update(void);
 /* VHCI state - only active after BT is initialized (OSI table written) */
 static bool vhci_active = false;
 
-/* VHCI mailbox state - track HCI data pointer for hexdump */
-static uint32_t vhci_hci_data_ptr = 0;  /* Pointer written to 0x7000 */
+/* VHCI slot-based execution state */
+static struct {
+    bool pending;              /* Job submitted, waiting for slot boundary */
+    uint32_t pending_pkt_ptr;  /* HCI packet pointer for pending job */
+    uint32_t cmd_type;         /* Command type (0 or 1) from 0x7004 */
+    uint32_t status;           /* Shadow VHCI_STATUS register */
+} vhci_state = {
+    .pending = false,
+    .pending_pkt_ptr = 0,
+    .cmd_type = 0,
+    .status = VHCI_STATUS_SEND_AVAIL | VHCI_STATUS_POWER_AWAKE,  /* Ready to receive */
+};
+
+/* Legacy pointer for hexdump (now aliased to vhci_state) */
+#define vhci_hci_data_ptr vhci_state.pending_pkt_ptr
 
 /* Intercepts the Data Plane (Exchange Memory) */
 static uint64_t btdm_em_read(void *opaque, hwaddr addr, unsigned size) {
@@ -274,67 +287,22 @@ static void btdm_em_write(void *opaque, hwaddr addr, uint64_t val, unsigned size
             }
         } else if (addr == VHCI_TRIGGER) {
             static int trigger_write_count = 0;
-            if (++trigger_write_count <= 20) {
+            if (++trigger_write_count <= 50) {
                 fprintf(stderr, ">>> VHCI write TRIGGER (0x701c): 0x%" PRIx64 "\n", val);
             }
-            if (val == 1) {
-                fprintf(stderr, ">>> VHCI: Packet trigger received\n");
+            if (val == 1 && vhci_state.pending_pkt_ptr != 0) {
+                /* Job submission: schedule for next slot boundary */
+                vhci_state.pending = true;
+                fprintf(stderr, ">>> VHCI: Job submitted to Slot Scheduler (ptr=0x%08x, cmd=%d)\n",
+                        vhci_state.pending_pkt_ptr, vhci_state.cmd_type);
             }
         } else if (addr == VHCI_CMD_TYPE) {
+            vhci_state.cmd_type = (uint32_t)val;
             fprintf(stderr, ">>> VHCI write CMD_TYPE (0x7004): 0x%" PRIx64 "\n", val);
         } else if (addr == VHCI_HCI_DATA_PTR) {
-            /* HCI data pointer written to 0x7088 - hexdump the packet */
-            vhci_hci_data_ptr = (uint32_t)val;
+            /* HCI data pointer written to 0x7088 - save for slot execution */
+            vhci_state.pending_pkt_ptr = (uint32_t)val;
             fprintf(stderr, ">>> VHCI write HCI_DATA_PTR (0x7088): 0x%" PRIx64 "\n", val);
-
-            /* Hexdump the HCI data */
-            uint32_t em_base = 0x3ffb0000;
-            if (vhci_hci_data_ptr >= em_base && vhci_hci_data_ptr < em_base + 0x10000) {
-                uint32_t offset = vhci_hci_data_ptr - em_base;
-                uint8_t *hci_buf = em_ptr + offset;
-
-                /* HCI packet format: type(1) + header + data
-                 * Command: type=0x01, opcode(2), len(1), params(len)
-                 * ACL:     type=0x02, handle(2), len(2), data(len)
-                 * Event:   type=0x04, code(1), len(1), params(len)
-                 */
-                uint8_t pkt_type = hci_buf[0];
-                int pkt_len = 4; /* minimum to show */
-                const char *pkt_name = "???";
-
-                if (pkt_type == 0x01) { /* HCI Command */
-                    pkt_name = "CMD";
-                    if (offset + 4 <= 0x10000) {
-                        pkt_len = 4 + hci_buf[3]; /* 1+2+1+params */
-                    }
-                } else if (pkt_type == 0x02) { /* ACL Data */
-                    pkt_name = "ACL";
-                    if (offset + 5 <= 0x10000) {
-                        pkt_len = 5 + (hci_buf[3] | (hci_buf[4] << 8)); /* 1+2+2+data */
-                    }
-                } else if (pkt_type == 0x04) { /* HCI Event */
-                    pkt_name = "EVT";
-                    if (offset + 3 <= 0x10000) {
-                        pkt_len = 3 + hci_buf[2]; /* 1+1+1+params */
-                    }
-                }
-
-                /* Clamp to reasonable size */
-                if (pkt_len > 64) pkt_len = 64;
-                if (offset + pkt_len > 0x10000) pkt_len = 0x10000 - offset;
-
-                fprintf(stderr, ">>> VHCI HCI %s @ 0x%08x (EM+0x%04x), len=%d:\n    ",
-                        pkt_name, vhci_hci_data_ptr, offset, pkt_len);
-                for (int i = 0; i < pkt_len; i++) {
-                    fprintf(stderr, "%02x ", hci_buf[i]);
-                    if ((i + 1) % 16 == 0 && i + 1 < pkt_len) {
-                        fprintf(stderr, "\n    ");
-                    }
-                }
-                fprintf(stderr, "\n");
-            } else {
-                fprintf(stderr, ">>> VHCI: HCI ptr 0x%08x outside EM range\n", vhci_hci_data_ptr);
-            }
         }
     }
 
@@ -1213,6 +1181,24 @@ static void ble_timer_cb(void *opaque)
     btdm_clock_counter += 625;
     btdm_state.blebasetimecnt = (btdm_state.blebasetimecnt + 1) & 0x07FFFFFF;
     btdm_state.blefinetimecnt = (btdm_state.blefinetimecnt + 312) & 0x3FF;
+
+    /* === VHCI Slot-based Execution === */
+    /* Execute pending VHCI job at slot boundary */
+    if (vhci_state.pending && vhci_active) {
+        vhci_state.pending = false;
+
+        fprintf(stderr, ">>> BT_LC: Slot boundary reached. Executing VHCI job from 0x%08x (cmd=%d)\n",
+                vhci_state.pending_pkt_ptr, vhci_state.cmd_type);
+
+        /* Set EVENT_AVAIL bit in shadow VHCI status to indicate completion */
+        vhci_state.status |= VHCI_STATUS_EVENT_AVAIL;
+
+        /* Set BT_LC_INTSTAT to indicate successful radio transaction */
+        bt_lc_state.intstat |= BT_LC_INT_GPIO_1_0;
+
+        /* Force an interrupt this tick to notify the host */
+        btdm_state.bleintrawstat |= BLE_SWINT_INTSTAT_BIT;
+    }
 
     /* Only generate interrupts if the previous one was acknowledged */
     /* This prevents interrupt storm - firmware must clear intstat before we fire again */
