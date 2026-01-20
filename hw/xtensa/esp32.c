@@ -337,7 +337,18 @@ static void btdm_em_write(void *opaque, hwaddr addr, uint64_t val, unsigned size
             }
         }
     }
-    
+
+    /* Monitor writes to the HCI buffer area if pointer is set */
+    if (vhci_hci_data_ptr != 0) {
+        uint32_t em_base = 0x3ffb0000;
+        uint32_t buf_offset = vhci_hci_data_ptr - em_base;
+        /* Check if this write is within 64 bytes of the HCI buffer */
+        if (addr >= buf_offset && addr < buf_offset + 64) {
+            fprintf(stderr, ">>> VHCI HCI_BUF write @ EM+0x%04" HWADDR_PRIx " (%d bytes) <- 0x%" PRIx64 "\n",
+                    addr, size, val);
+        }
+    }
+
     /* Skip zero-value writes (initialization spam) unless debug >= 3 */
     if (val == 0 && btdm_em_debug_level < 3) {
         return;
