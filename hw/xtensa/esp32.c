@@ -141,14 +141,11 @@ static void ble_timer_update(void);
 
 /* VHCI register offsets (from EM base 0x3ffb0000, so 0x7000 = 0x3ffb7000) */
 #define VHCI_OFFSET             0x7000
-#define VHCI_HCI_DATA           0x7000  /* Mailbox: Write/Read HCI bytes here */
+#define VHCI_CMD_TYPE           0x7004  /* Command type/direction: 0 or 1 */
 #define VHCI_STATUS             0x700c  /* Status register with bit-fields */
 #define VHCI_HW_LOCK            0x7018  /* Hardware spinlock: write 0xCDCD to lock */
 #define VHCI_TRIGGER            0x701c  /* Trigger: write 1 to signal "packet ready" */
-
-/* Legacy aliases */
-#define VHCI_HOST_READY         VHCI_HCI_DATA
-#define VHCI_CTRL_STATUS        0x7004
+#define VHCI_HCI_DATA_PTR       0x7088  /* Pointer to HCI data buffer */
 
 /* VHCI_STATUS (0x700c) bit definitions */
 #define VHCI_STATUS_SEND_AVAIL      (1 << 0)  /* Host can send a packet */
@@ -162,6 +159,9 @@ static void ble_timer_update(void);
 
 /* VHCI state - only active after BT is initialized (OSI table written) */
 static bool vhci_active = false;
+
+/* VHCI mailbox state - track HCI data pointer for hexdump */
+static uint32_t vhci_hci_data_ptr = 0;  /* Pointer written to 0x7000 */
 
 /* Intercepts the Data Plane (Exchange Memory) */
 static uint64_t btdm_em_read(void *opaque, hwaddr addr, unsigned size) {
@@ -254,6 +254,13 @@ static void btdm_em_write(void *opaque, hwaddr addr, uint64_t val, unsigned size
 
     /* VHCI register writes - only intercept after BT is fully initialized */
     if (vhci_active && addr >= VHCI_OFFSET && addr < VHCI_OFFSET + 0x100) {
+        /* Log ALL writes in VHCI region to understand the protocol */
+        static int vhci_write_count = 0;
+        if (++vhci_write_count <= 100) {
+            fprintf(stderr, ">>> VHCI write 0x%04" HWADDR_PRIx " (%d bytes) <- 0x%" PRIx64 "\n",
+                    addr, size, val);
+        }
+
         if (addr == VHCI_STATUS) {
             static int status_write_count = 0;
             if (++status_write_count <= 10) {
@@ -271,17 +278,62 @@ static void btdm_em_write(void *opaque, hwaddr addr, uint64_t val, unsigned size
                 fprintf(stderr, ">>> VHCI write TRIGGER (0x701c): 0x%" PRIx64 "\n", val);
             }
             if (val == 1) {
-                /* Host signaled packet ready
-                 * NOTE: Do NOT write to em_ptr + VHCI_STATUS - that memory region
-                 * overlaps with FreeRTOS queue structures and writing there corrupts
-                 * the heap. The BT stack expects normal memory semantics here.
-                 */
-                fprintf(stderr, ">>> VHCI: Packet trigger received (ready for HCI)\n");
+                fprintf(stderr, ">>> VHCI: Packet trigger received\n");
             }
-        } else if (addr == VHCI_HCI_DATA) {
-            static int hci_write_count = 0;
-            if (++hci_write_count <= 20) {
-                fprintf(stderr, ">>> VHCI write HCI_DATA (0x7000): 0x%" PRIx64 "\n", val);
+        } else if (addr == VHCI_CMD_TYPE) {
+            fprintf(stderr, ">>> VHCI write CMD_TYPE (0x7004): 0x%" PRIx64 "\n", val);
+        } else if (addr == VHCI_HCI_DATA_PTR) {
+            /* HCI data pointer written to 0x7088 - hexdump the packet */
+            vhci_hci_data_ptr = (uint32_t)val;
+            fprintf(stderr, ">>> VHCI write HCI_DATA_PTR (0x7088): 0x%" PRIx64 "\n", val);
+
+            /* Hexdump the HCI data */
+            uint32_t em_base = 0x3ffb0000;
+            if (vhci_hci_data_ptr >= em_base && vhci_hci_data_ptr < em_base + 0x10000) {
+                uint32_t offset = vhci_hci_data_ptr - em_base;
+                uint8_t *hci_buf = em_ptr + offset;
+
+                /* HCI packet format: type(1) + header + data
+                 * Command: type=0x01, opcode(2), len(1), params(len)
+                 * ACL:     type=0x02, handle(2), len(2), data(len)
+                 * Event:   type=0x04, code(1), len(1), params(len)
+                 */
+                uint8_t pkt_type = hci_buf[0];
+                int pkt_len = 4; /* minimum to show */
+                const char *pkt_name = "???";
+
+                if (pkt_type == 0x01) { /* HCI Command */
+                    pkt_name = "CMD";
+                    if (offset + 4 <= 0x10000) {
+                        pkt_len = 4 + hci_buf[3]; /* 1+2+1+params */
+                    }
+                } else if (pkt_type == 0x02) { /* ACL Data */
+                    pkt_name = "ACL";
+                    if (offset + 5 <= 0x10000) {
+                        pkt_len = 5 + (hci_buf[3] | (hci_buf[4] << 8)); /* 1+2+2+data */
+                    }
+                } else if (pkt_type == 0x04) { /* HCI Event */
+                    pkt_name = "EVT";
+                    if (offset + 3 <= 0x10000) {
+                        pkt_len = 3 + hci_buf[2]; /* 1+1+1+params */
+                    }
+                }
+
+                /* Clamp to reasonable size */
+                if (pkt_len > 64) pkt_len = 64;
+                if (offset + pkt_len > 0x10000) pkt_len = 0x10000 - offset;
+
+                fprintf(stderr, ">>> VHCI HCI %s @ 0x%08x (EM+0x%04x), len=%d:\n    ",
+                        pkt_name, vhci_hci_data_ptr, offset, pkt_len);
+                for (int i = 0; i < pkt_len; i++) {
+                    fprintf(stderr, "%02x ", hci_buf[i]);
+                    if ((i + 1) % 16 == 0 && i + 1 < pkt_len) {
+                        fprintf(stderr, "\n    ");
+                    }
+                }
+                fprintf(stderr, "\n");
+            } else {
+                fprintf(stderr, ">>> VHCI: HCI ptr 0x%08x outside EM range\n", vhci_hci_data_ptr);
             }
         }
     }
