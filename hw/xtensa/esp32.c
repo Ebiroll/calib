@@ -201,14 +201,12 @@ static void btdm_em_write(void *opaque, hwaddr addr, uint64_t val, unsigned size
 
     memcpy(em_ptr + addr, &val, size);
 
-    /* VHCI register writes - signal host ready when CPU writes here */
-    if (addr >= VHCI_OFFSET && addr < VHCI_OFFSET + 0x100) {
-        fprintf(stderr, ">>> VHCI write: offset 0x%04" HWADDR_PRIx " <- 0x%" PRIx64 "\n", addr, val);
-        /* When CPU writes to VHCI, set host ready status */
-        em_ptr[VHCI_HOST_READY] = 1;  /* Host is ready */
-        em_ptr[VHCI_HOST_READY + 1] = 0;
-        em_ptr[VHCI_HOST_READY + 2] = 0;
-        em_ptr[VHCI_HOST_READY + 3] = 0;
+    /* VHCI register writes - log only, don't modify other memory
+     * NOTE: The region 0x7000-0x7100 overlaps with heap space where FreeRTOS
+     * queues may be allocated. We must not modify memory indiscriminately.
+     */
+    if (addr == VHCI_HOST_READY) {
+        fprintf(stderr, ">>> VHCI write HOST_READY: 0x%" PRIx64 "\n", val);
     }
 
     /* Monitor controller status writes at 0x3ffbf3fc */
