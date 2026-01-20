@@ -260,9 +260,24 @@ static void btdm_em_write(void *opaque, hwaddr addr, uint64_t val, unsigned size
                 fprintf(stderr, ">>> VHCI write STATUS (0x700c): 0x%" PRIx64 "\n", val);
             }
         } else if (addr == VHCI_HW_LOCK) {
-            fprintf(stderr, ">>> VHCI write HW_LOCK (0x7018): 0x%" PRIx64 "\n", val);
+            static int lock_write_count = 0;
+            if (++lock_write_count <= 20) {
+                fprintf(stderr, ">>> VHCI write HW_LOCK (0x7018): 0x%" PRIx64 " (%s)\n",
+                        val, (val == 0xcdcd) ? "LOCK" : "UNLOCK");
+            }
         } else if (addr == VHCI_TRIGGER) {
-            fprintf(stderr, ">>> VHCI write TRIGGER (0x701c): 0x%" PRIx64 "\n", val);
+            static int trigger_write_count = 0;
+            if (++trigger_write_count <= 20) {
+                fprintf(stderr, ">>> VHCI write TRIGGER (0x701c): 0x%" PRIx64 "\n", val);
+            }
+            if (val == 1) {
+                /* Host signaled packet ready
+                 * NOTE: Do NOT write to em_ptr + VHCI_STATUS - that memory region
+                 * overlaps with FreeRTOS queue structures and writing there corrupts
+                 * the heap. The BT stack expects normal memory semantics here.
+                 */
+                fprintf(stderr, ">>> VHCI: Packet trigger received (ready for HCI)\n");
+            }
         } else if (addr == VHCI_HCI_DATA) {
             static int hci_write_count = 0;
             if (++hci_write_count <= 20) {
