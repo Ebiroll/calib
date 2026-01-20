@@ -141,11 +141,27 @@ static void ble_timer_update(void);
 
 /* VHCI register offsets (from EM base 0x3ffb0000, so 0x7000 = 0x3ffb7000) */
 #define VHCI_OFFSET             0x7000
-#define VHCI_HOST_READY         0x7000  /* Host ready status */
-#define VHCI_CTRL_STATUS        0x7004  /* Controller status */
+#define VHCI_HCI_DATA           0x7000  /* Mailbox: Write/Read HCI bytes here */
+#define VHCI_STATUS             0x700c  /* Status register with bit-fields */
+#define VHCI_HW_LOCK            0x7018  /* Hardware spinlock: write 0xCDCD to lock */
+#define VHCI_TRIGGER            0x701c  /* Trigger: write 1 to signal "packet ready" */
+
+/* Legacy aliases */
+#define VHCI_HOST_READY         VHCI_HCI_DATA
+#define VHCI_CTRL_STATUS        0x7004
+
+/* VHCI_STATUS (0x700c) bit definitions */
+#define VHCI_STATUS_SEND_AVAIL      (1 << 0)  /* Host can send a packet */
+#define VHCI_STATUS_EVENT_AVAIL     (1 << 1)  /* Controller has event/data for host */
+#define VHCI_STATUS_INTR_PENDING    (1 << 2)  /* Hardware interrupt pending */
+#define VHCI_STATUS_ERR_OCCURRED    (1 << 3)  /* Transport/hardware error */
+#define VHCI_STATUS_POWER_AWAKE     (1 << 8)  /* Controller is awake (not deep sleep) */
 
 /* Controller status offset (0x3ffbf3fc = EM base + 0xf3fc) */
 #define BTDM_CTRL_STATUS_OFFSET 0xf3fc
+
+/* VHCI state - only active after BT is initialized (OSI table written) */
+static bool vhci_active = false;
 
 /* Intercepts the Data Plane (Exchange Memory) */
 static uint64_t btdm_em_read(void *opaque, hwaddr addr, unsigned size) {
@@ -153,13 +169,18 @@ static uint64_t btdm_em_read(void *opaque, hwaddr addr, unsigned size) {
     uint32_t val = 0;
     memcpy(&val, em_ptr + addr, size);
 
-    /* VHCI register reads - return host ready status */
-    if (addr >= VHCI_OFFSET && addr < VHCI_OFFSET + 0x100) {
-        if (addr == VHCI_HOST_READY) {
-            /* Return host ready = 1 */
-            val = 1;
-            fprintf(stderr, ">>> VHCI read HOST_READY: returning 1\n");
+    /* VHCI register reads - just log, don't modify return value
+     * The region 0x7000-0x7100 overlaps with heap memory used by BT stack.
+     * Modifying read values can corrupt queue/semaphore structures.
+     */
+    if (vhci_active && addr >= VHCI_OFFSET && addr < VHCI_OFFSET + 0x100) {
+        if (addr == VHCI_STATUS) {
+            static int status_read_count = 0;
+            if (++status_read_count <= 5 || (status_read_count % 10000) == 0) {
+                fprintf(stderr, ">>> VHCI read STATUS (0x700c): mem=0x%x (count=%d)\n", val, status_read_count);
+            }
         }
+        /* Return memory content unchanged */
     }
 
     /* Controller status read at 0x3ffbf3fc - return 0 to indicate controller enabled */
@@ -201,14 +222,6 @@ static void btdm_em_write(void *opaque, hwaddr addr, uint64_t val, unsigned size
 
     memcpy(em_ptr + addr, &val, size);
 
-    /* VHCI register writes - log only, don't modify other memory
-     * NOTE: The region 0x7000-0x7100 overlaps with heap space where FreeRTOS
-     * queues may be allocated. We must not modify memory indiscriminately.
-     */
-    if (addr == VHCI_HOST_READY) {
-        fprintf(stderr, ">>> VHCI write HOST_READY: 0x%" PRIx64 "\n", val);
-    }
-
     /* Monitor controller status writes at 0x3ffbf3fc */
     if (addr == BTDM_CTRL_STATUS_OFFSET ||
         (addr <= BTDM_CTRL_STATUS_OFFSET && addr + size > BTDM_CTRL_STATUS_OFFSET)) {
@@ -216,7 +229,7 @@ static void btdm_em_write(void *opaque, hwaddr addr, uint64_t val, unsigned size
         memcpy(&status, em_ptr + BTDM_CTRL_STATUS_OFFSET, 4);
         fprintf(stderr, ">>> BTDM controller status write: 0x%x (addr 0x%04" HWADDR_PRIx ")\n", status, addr);
     }
-    
+
     /* Detect when OSI table is fully written (last entry at 0x2A50) */
     if (!osi_table_written && addr >= 0x2A50 && addr < 0x2A60) {
         osi_table_written = true;
@@ -224,16 +237,37 @@ static void btdm_em_write(void *opaque, hwaddr addr, uint64_t val, unsigned size
     }
     
     /* Only count post-OSI CS writes (0x2A60-0x2C00) AFTER OSI table is written */
-    if (!ble_timer_force_started && osi_table_written && 
+    if (!ble_timer_force_started && osi_table_written &&
         addr >= BLE_OSI_FUNCS_END && addr < 0x2C00) {
         ble_cs_write_count++;
         if (ble_cs_write_count >= 50) {
             /* Post-OSI CS writes detected - initialization should be complete */
             ble_timer_force_started = true;
-            fprintf(stderr, ">>> BTDM: Force-starting BLE timer (after %d post-OSI CS writes at 0x%04" HWADDR_PRIx ")\n", 
+            vhci_active = true;  /* NOW enable VHCI register interception */
+            fprintf(stderr, ">>> BTDM: Force-starting BLE timer (after %d post-OSI CS writes at 0x%04" HWADDR_PRIx ")\n",
                     ble_cs_write_count, addr);
+            fprintf(stderr, ">>> BTDM: VHCI now active\n");
             ble_force_start_timer();
             fprintf(stderr, ">>> BTDM: Timer force-start complete, enabled=%d\n", ble_timer_state.enabled);
+        }
+    }
+
+    /* VHCI register writes - only intercept after BT is fully initialized */
+    if (vhci_active && addr >= VHCI_OFFSET && addr < VHCI_OFFSET + 0x100) {
+        if (addr == VHCI_STATUS) {
+            static int status_write_count = 0;
+            if (++status_write_count <= 10) {
+                fprintf(stderr, ">>> VHCI write STATUS (0x700c): 0x%" PRIx64 "\n", val);
+            }
+        } else if (addr == VHCI_HW_LOCK) {
+            fprintf(stderr, ">>> VHCI write HW_LOCK (0x7018): 0x%" PRIx64 "\n", val);
+        } else if (addr == VHCI_TRIGGER) {
+            fprintf(stderr, ">>> VHCI write TRIGGER (0x701c): 0x%" PRIx64 "\n", val);
+        } else if (addr == VHCI_HCI_DATA) {
+            static int hci_write_count = 0;
+            if (++hci_write_count <= 20) {
+                fprintf(stderr, ">>> VHCI write HCI_DATA (0x7000): 0x%" PRIx64 "\n", val);
+            }
         }
     }
     
