@@ -160,17 +160,26 @@ static void ble_timer_update(void);
 /* VHCI state - only active after BT is initialized (OSI table written) */
 static bool vhci_active = false;
 
+/* VHCI environment pointer location (in DRAM, discovered via RE)
+ * vhci_env_p at 0x3ffc3d38 points to VHCI env structure
+ * Byte at offset 33 of that structure is the send_available flag
+ */
+#define VHCI_ENV_P_ADDR     0x3ffc3d38
+#define VHCI_SEND_AVAIL_OFF 33
+
 /* VHCI slot-based execution state */
 static struct {
     bool pending;              /* Job submitted, waiting for slot boundary */
     uint32_t pending_pkt_ptr;  /* HCI packet pointer for pending job */
     uint32_t cmd_type;         /* Command type (0 or 1) from 0x7004 */
     uint32_t status;           /* Shadow VHCI_STATUS register */
+    uint32_t env_ptr;          /* Cached vhci_env_p value */
 } vhci_state = {
     .pending = false,
     .pending_pkt_ptr = 0,
     .cmd_type = 0,
     .status = VHCI_STATUS_SEND_AVAIL | VHCI_STATUS_POWER_AWAKE,  /* Ready to receive */
+    .env_ptr = 0,
 };
 
 /* Legacy pointer for hexdump (now aliased to vhci_state) */
@@ -182,18 +191,17 @@ static uint64_t btdm_em_read(void *opaque, hwaddr addr, unsigned size) {
     uint32_t val = 0;
     memcpy(&val, em_ptr + addr, size);
 
-    /* VHCI register reads - just log, don't modify return value
+    /* VHCI register reads - just log, don't intercept
      * The region 0x7000-0x7100 overlaps with heap memory used by BT stack.
-     * Modifying read values can corrupt queue/semaphore structures.
+     * We cannot safely intercept reads because FreeRTOS queues use the same addresses.
+     * The VHCI status must be communicated via a different mechanism.
      */
-    if (vhci_active && addr >= VHCI_OFFSET && addr < VHCI_OFFSET + 0x100) {
-        if (addr == VHCI_STATUS) {
-            static int status_read_count = 0;
-            if (++status_read_count <= 5 || (status_read_count % 10000) == 0) {
-                fprintf(stderr, ">>> VHCI read STATUS (0x700c): mem=0x%x (count=%d)\n", val, status_read_count);
-            }
+    if (vhci_active && addr == VHCI_STATUS) {
+        static int status_read_count = 0;
+        if (++status_read_count <= 20 || (status_read_count % 1000) == 0) {
+            fprintf(stderr, ">>> VHCI read STATUS (0x700c): mem=0x%x, shadow=0x%x (count=%d)\n",
+                    val, vhci_state.status, status_read_count);
         }
-        /* Return memory content unchanged */
     }
 
     /* Controller status read at 0x3ffbf3fc - return 0 to indicate controller enabled */
@@ -260,6 +268,7 @@ static void btdm_em_write(void *opaque, hwaddr addr, uint64_t val, unsigned size
             fprintf(stderr, ">>> BTDM: Force-starting BLE timer (after %d post-OSI CS writes at 0x%04" HWADDR_PRIx ")\n",
                     ble_cs_write_count, addr);
             fprintf(stderr, ">>> BTDM: VHCI now active\n");
+            /* NOTE: Cannot write to VHCI_STATUS (0x700c) - it overlaps with heap at 0x3ffb6388-0x3ffb8000 */
             ble_force_start_timer();
             fprintf(stderr, ">>> BTDM: Timer force-start complete, enabled=%d\n", ble_timer_state.enabled);
         }
@@ -1182,6 +1191,24 @@ static void ble_timer_cb(void *opaque)
     btdm_state.blebasetimecnt = (btdm_state.blebasetimecnt + 1) & 0x07FFFFFF;
     btdm_state.blefinetimecnt = (btdm_state.blefinetimecnt + 312) & 0x3FF;
 
+    /* === VHCI Send Available Flag Management === */
+    /* The send_available flag is at vhci_env_p->byte[33]
+     * vhci_env_p is stored at DRAM address 0x3ffc3d38
+     * We periodically set this flag to 1 to indicate controller is ready */
+    if (vhci_active && (btdm_state.blebasetimecnt & 0xF) == 0) {
+        /* Check every 16 slots (~10ms) */
+        uint32_t env_ptr = 0;
+        cpu_physical_memory_read(VHCI_ENV_P_ADDR, &env_ptr, 4);
+        if (env_ptr != 0 && env_ptr != vhci_state.env_ptr) {
+            vhci_state.env_ptr = env_ptr;
+            fprintf(stderr, ">>> VHCI: Discovered vhci_env_p = 0x%08x\n", env_ptr);
+        }
+        if (vhci_state.env_ptr != 0) {
+            uint8_t send_avail = 1;
+            cpu_physical_memory_write(vhci_state.env_ptr + VHCI_SEND_AVAIL_OFF, &send_avail, 1);
+        }
+    }
+
     /* === VHCI Slot-based Execution === */
     /* Execute pending VHCI job at slot boundary */
     if (vhci_state.pending && vhci_active) {
@@ -1192,6 +1219,14 @@ static void ble_timer_cb(void *opaque)
 
         /* Set EVENT_AVAIL bit in shadow VHCI status to indicate completion */
         vhci_state.status |= VHCI_STATUS_EVENT_AVAIL;
+        /* Also ensure SEND_AVAIL stays set (ready for more packets) */
+        vhci_state.status |= VHCI_STATUS_SEND_AVAIL;
+
+        /* Also set the send_available flag in the vhci_env structure */
+        if (vhci_state.env_ptr != 0) {
+            uint8_t send_avail = 1;
+            cpu_physical_memory_write(vhci_state.env_ptr + VHCI_SEND_AVAIL_OFF, &send_avail, 1);
+        }
 
         /* Set BT_LC_INTSTAT to indicate successful radio transaction */
         bt_lc_state.intstat |= BT_LC_INT_GPIO_1_0;
