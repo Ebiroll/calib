@@ -1768,14 +1768,24 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
                            memmap[ESP32_MEMREGION_RTCSLOW].size, &error_fatal);
     memory_region_add_subregion(sys_mem, memmap[ESP32_MEMREGION_RTCSLOW].base, rtcslow);
 
-    /* RTC Fast memory is only accessible by the PRO CPU */
+    /* RTC Fast memory — per TRM only PRO CPU should access it, but the
+     * BLE controller blob runs on APP CPU (core 1) and reads 0x3ff80068,
+     * so map it for both cores to avoid LoadStorePIFAddrError. */
 
     memory_region_init_ram(rtcfast_i, NULL, "esp32.rtcfast_i",
-                           memmap[ESP32_MEMREGION_RTCSLOW].size, &error_fatal);
+                           memmap[ESP32_MEMREGION_RTCFAST_I].size, &error_fatal);
     memory_region_add_subregion(&s->cpu_specific_mem[0], memmap[ESP32_MEMREGION_RTCFAST_I].base, rtcfast_i);
 
     memory_region_init_alias(rtcfast_d, NULL, "esp32.rtcfast_d", rtcfast_i, 0, memmap[ESP32_MEMREGION_RTCFAST_D].size);
     memory_region_add_subregion(&s->cpu_specific_mem[0], memmap[ESP32_MEMREGION_RTCFAST_D].base, rtcfast_d);
+
+    /* Also map RTC Fast for APP CPU (core 1) so BLE controller can access it */
+    MemoryRegion *rtcfast_i_cpu1 = g_new(MemoryRegion, 1);
+    MemoryRegion *rtcfast_d_cpu1 = g_new(MemoryRegion, 1);
+    memory_region_init_alias(rtcfast_i_cpu1, NULL, "esp32.rtcfast_i.cpu1", rtcfast_i, 0, memmap[ESP32_MEMREGION_RTCFAST_I].size);
+    memory_region_add_subregion(&s->cpu_specific_mem[1], memmap[ESP32_MEMREGION_RTCFAST_I].base, rtcfast_i_cpu1);
+    memory_region_init_alias(rtcfast_d_cpu1, NULL, "esp32.rtcfast_d.cpu1", rtcfast_i, 0, memmap[ESP32_MEMREGION_RTCFAST_D].size);
+    memory_region_add_subregion(&s->cpu_specific_mem[1], memmap[ESP32_MEMREGION_RTCFAST_D].base, rtcfast_d_cpu1);
 
     /* 1. Link Controller / BT RF registers (0x3ff51000) - MMIO for interrupt handling
      * The btdm_bb_isr reads 0x3ff51100 (intstat) and writes 0x3ff51104 (intack).

@@ -880,6 +880,7 @@ static void sdl2_display_init(DisplayState *ds, DisplayOptions *o)
         QemuConsole *con = qemu_console_lookup_by_index(i);
         assert(con != NULL);
         if (!qemu_console_is_graphic(con) &&
+            !qemu_console_is_fixedsize(con) &&
             qemu_console_get_index(con) != 0) {
             sdl2_console[i].hidden = true;
         }
